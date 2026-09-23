@@ -7,26 +7,48 @@ RT_MANIFEST 24 "ghostty.manifest"
 #define ID_ICON_GHOSTTY 1
 ID_ICON_GHOSTTY ICON "ghostty.ico"
 
+#ifndef VERSION_MAJOR
+#define VERSION_MAJOR 0
+#endif
+#ifndef VERSION_MINOR
+#define VERSION_MINOR 0
+#endif
+#ifndef VERSION_PATCH
+#define VERSION_PATCH 0
+#endif
+#ifndef VERSION_STRING
+#define VERSION_STRING "0.0.0"
+#endif
+
+// VS_FF_DEBUG
+#ifdef GHOSTTY_DEBUG
+#define GHOSTTY_FILEFLAGS 0x1L
+#else
+#define GHOSTTY_FILEFLAGS 0x0L
+#endif
+
+#define VS_VERSION_INFO 1
 VS_VERSION_INFO VERSIONINFO
-//FILEVERSION     VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,VERSION_COMMIT_HEIGHT
-//PRODUCTVERSION  VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,VERSION_COMMIT_HEIGHT
-//FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
-//FILEFLAGS               VER_DBG
-//FILEOS                  VOS_NT
-//FILETYPE                VFT_APP
-//FILESUBTYPE             VFT2_UNKNOWN
+FILEVERSION     VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+PRODUCTVERSION  VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+FILEFLAGSMASK   0x3fL // VS_FFI_FILEFLAGSMASK
+FILEFLAGS       GHOSTTY_FILEFLAGS
+FILEOS          0x40004L // VOS_NT_WINDOWS32
+FILETYPE        0x1L // VFT_APP
+FILESUBTYPE     0x0L // VFT2_UNKNOWN
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
         BLOCK "040904b0"
         BEGIN
-        //VALUE "CompanyName",        "???"
-        //VALUE "FileDescription",    "???"
-        //VALUE "FileVersion",        VERSION
-        //VALUE "LegalCopyright",     "(C) 2024 ???"
-        VALUE "OriginalFilename", "ghostty.exe"
+        VALUE "CompanyName",        "Ghostty for Windows contributors"
+        VALUE "FileDescription",    "Ghostty Terminal"
+        VALUE "FileVersion",        VERSION_STRING
+        VALUE "InternalName",       "ghostty"
+        VALUE "LegalCopyright",     "Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors; Copyright (c) 2026 Josh Auriemma"
+        VALUE "OriginalFilename",   "ghostty.exe"
         VALUE "ProductName",        "Ghostty"
-        //VALUE "ProductVersion",     VERSION
+        VALUE "ProductVersion",     VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"

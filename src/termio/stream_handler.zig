@@ -39,7 +39,7 @@ pub const StreamHandler = struct {
 
     /// A handle to wake up the renderer. This hints to the renderer that
     /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    renderer_wakeup: *xev.Async,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
@@ -1482,11 +1482,6 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
-            return;
-        }
-
         // Attempt to parse this file-style URI using options appropriate
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
         // unencoded path).
@@ -1506,8 +1501,8 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buffer) catch |err| switch (err) {
-            error.UriMissingHost => {
+        const host: std.Io.net.HostName = uri.getHost(&host_buffer) catch |err| switch (err) {
+            error.UriMissingHost => if (builtin.os.tag == .windows) .{ .bytes = "" } else {
                 log.warn("OSC 7 uri must contain a hostname: {}", .{err});
                 return;
             },
@@ -1516,14 +1511,15 @@ pub const StreamHandler = struct {
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
         // is to valid the hostname to be local.
-        const host_valid = internal_os.hostname.isLocal(host.bytes) catch |err| switch (err) {
-            error.PermissionDenied,
-            error.Unexpected,
-            => {
-                log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
-                return;
-            },
-        };
+        const host_valid = (builtin.os.tag == .windows and host.bytes.len == 0) or
+            internal_os.hostname.isLocal(host.bytes) catch |err| switch (err) {
+                error.PermissionDenied,
+                error.Unexpected,
+                => {
+                    log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
+                    return;
+                },
+            };
         if (!host_valid) {
             log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
             return;
@@ -1534,7 +1530,15 @@ pub const StreamHandler = struct {
         var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
         var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        const path_alloc = stack_alloc.get();
+        const uri_path = try uri.path.toRawMaybeAlloc(path_alloc);
+        const path = if (comptime builtin.os.tag == .windows)
+            try windowsPathFromUriPath(path_alloc, uri_path) orelse {
+                log.warn("OSC 7 path must be an absolute drive path: {s}", .{uri_path});
+                return;
+            }
+        else
+            uri_path;
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
@@ -1552,6 +1556,23 @@ pub const StreamHandler = struct {
             try self.windowTitle(path);
             self.seen_title = false;
         }
+    }
+
+    fn windowsPathFromUriPath(alloc: Allocator, uri_path: []const u8) Allocator.Error!?[]const u8 {
+        if (uri_path.len < 3 or uri_path[0] != '/' or
+            !std.ascii.isAlphabetic(uri_path[1]) or uri_path[2] != ':') return null;
+        const rest = uri_path[3..];
+        if (rest.len > 0 and rest[0] != '/') return null;
+
+        const out = try alloc.alloc(u8, if (rest.len == 0) 3 else uri_path.len - 1);
+        @memcpy(out[0..2], uri_path[1..3]);
+        if (rest.len == 0) {
+            out[2] = '\\';
+        } else {
+            @memcpy(out[2..], rest);
+            std.mem.replaceScalar(u8, out[2..], '/', '\\');
+        }
+        return out;
     }
 
     fn colorOperation(
@@ -1967,4 +1988,54 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "windowsPathFromUriPath" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "/C:/Users/x", "C:\\Users\\x" },
+        .{ "/c:/", "c:\\" },
+        .{ "/D:", "D:\\" },
+        .{ "/C:/Program Files/a b", "C:\\Program Files\\a b" },
+        .{ "/home/user", null },
+        .{ "/C:foo", null },
+        .{ "C:/Users", null },
+        .{ "", null },
+    };
+    for (cases) |case| {
+        const got = try StreamHandler.windowsPathFromUriPath(alloc, case[0]);
+        defer if (got) |v| alloc.free(v);
+        if (case[1]) |want| {
+            try testing.expectEqualStrings(want, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
+}
+
+test "windowsPathFromUriPath: OSC 7 file URIs" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "file:///C:/Users/x", "", "C:\\Users\\x" },
+        .{ "file://myhost/C:/Users/x", "myhost", "C:\\Users\\x" },
+        .{ "file://localhost/C:/Program%20Files", "localhost", "C:\\Program Files" },
+        .{ "kitty-shell-cwd://myhost/D:/a b", "myhost", "D:\\a b" },
+    };
+    for (cases) |case| {
+        const uri = try internal_os.uri.parse(case[0], .{
+            .mac_address = true,
+            .raw_path = std.mem.startsWith(u8, case[0], "kitty-shell-cwd://"),
+        });
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = if (uri.getHost(&host_buffer)) |h| h.bytes else |_| "";
+        try testing.expectEqualStrings(case[1], host);
+        const uri_path = try uri.path.toRawMaybeAlloc(alloc);
+        const path = (try StreamHandler.windowsPathFromUriPath(alloc, uri_path)).?;
+        try testing.expectEqualStrings(case[2], path);
+    }
 }

@@ -951,18 +951,12 @@ pub const CoreText = struct {
     };
 };
 
-/// Windows font discovery. Enumerates font files in the system and
-/// per-user font directories and matches them to a descriptor via
-/// FreeType's family_name field (with a fallback to the SFNT name
-/// table when family_name is missing).
-///
-/// No external service is used; each discover() call walks the
-/// directories, opening candidate files with FreeType only as needed.
-/// For typical Windows installations (~300 fonts) a name query is in
-/// the tens of milliseconds. A codepoint fallback query may be
-/// noticeably slower because every candidate has to be opened to
-/// probe its CMap.
+/// Windows font discovery. A process-global index of every face in the
+/// system and per-user font directories (plus the fonts registered in
+/// the registry) is built on first use and then scored per request.
 pub const Windows = struct {
+    const freetype = @import("freetype");
+
     lib: Library,
 
     pub fn init(lib: Library) Windows {
@@ -978,17 +972,7 @@ pub const Windows = struct {
         alloc: Allocator,
         desc: Descriptor,
     ) !DiscoverIterator {
-        return .{
-            .alloc = alloc,
-            .lib = self.lib,
-            .desc = desc,
-            .variations = desc.variations,
-            .state = .system,
-            .dir = null,
-            .iter = null,
-            .system_path = null,
-            .user_path = null,
-        };
+        return try self.search(alloc, desc, false);
     }
 
     pub fn discoverFallback(
@@ -998,216 +982,635 @@ pub const Windows = struct {
         desc: Descriptor,
     ) !DiscoverIterator {
         _ = collection;
-        return self.discover(alloc, desc);
+        return try self.search(alloc, desc, true);
     }
+
+    fn search(
+        self: *const Windows,
+        alloc: Allocator,
+        desc: Descriptor,
+        fallback: bool,
+    ) !DiscoverIterator {
+        const index = try Index.get();
+        const curated: []const []const u8 = if (fallback and desc.codepoint != 0)
+            curatedFallback(desc.codepoint, index.locale)
+        else
+            &.{};
+
+        var candidates: std.ArrayList(Candidate) = .empty;
+        errdefer candidates.deinit(alloc);
+        for (index.entries, 0..) |*entry, i| {
+            if (desc.codepoint != 0 and !entry.coverage.mayHave(desc.codepoint)) continue;
+            const s = Score.score(&desc, entry, curated) orelse continue;
+            try candidates.append(alloc, .{ .entry = @intCast(i), .score = s });
+        }
+        std.mem.sort(Candidate, candidates.items, {}, Candidate.greaterThan);
+
+        return .{
+            .alloc = alloc,
+            .lib = self.lib,
+            .entries = index.entries,
+            .candidates = try candidates.toOwnedSlice(alloc),
+            .codepoint = desc.codepoint,
+            .variations = desc.variations,
+        };
+    }
+
+    const Candidate = struct {
+        entry: u32,
+        score: Score,
+
+        fn greaterThan(_: void, a: Candidate, b: Candidate) bool {
+            return a.score.int() > b.score.int();
+        }
+    };
+
+    const Score = packed struct {
+        const Backing = @typeInfo(@This()).@"struct".backing_integer.?;
+
+        weight: u10 = 0,
+        fuzzy_style: u8 = 0,
+        bold: bool = false,
+        italic: bool = false,
+        exact_style: bool = false,
+        variable: bool = false,
+        monospace: bool = false,
+        family: u2 = 0,
+        curated: u5 = 0,
+
+        fn int(self: Score) Backing {
+            return @bitCast(self);
+        }
+
+        fn score(
+            desc: *const Descriptor,
+            entry: *const Entry,
+            curated: []const []const u8,
+        ) ?Score {
+            var self: Score = .{};
+
+            if (desc.family) |family| {
+                if (std.ascii.eqlIgnoreCase(entry.family, family)) {
+                    self.family = 2;
+                } else if (entry.hasAltName(family)) {
+                    self.family = 1;
+                } else return null;
+            }
+
+            if (desc.style == null) {
+                if (desc.bold and !entry.bold) return null;
+                if (desc.italic and !entry.italic) return null;
+            }
+
+            for (curated, 0..) |name, i| {
+                if (std.ascii.eqlIgnoreCase(entry.family, name) or
+                    entry.hasAltName(name))
+                {
+                    self.curated = @intCast(curated.len - i);
+                    break;
+                }
+            }
+
+            self.monospace = desc.monospace and entry.monospace;
+            self.variable = desc.variations.len > 0 and entry.variable;
+            self.bold = desc.bold == entry.bold;
+            self.italic = desc.italic == entry.italic;
+
+            const desired_styles: []const [:0]const u8 = desired: {
+                if (desc.style) |s| break :desired &.{s};
+                if (desc.bold) {
+                    if (desc.italic) break :desired &.{ "bold italic", "bold", "italic", "oblique" };
+                    break :desired &.{ "bold", "upright" };
+                } else if (desc.italic) {
+                    break :desired &.{ "italic", "regular", "oblique" };
+                }
+                break :desired &.{ "regular", "upright" };
+            };
+
+            self.exact_style = std.ascii.eqlIgnoreCase(entry.style, desired_styles[0]);
+            const fuzzy_type = @TypeOf(self.fuzzy_style);
+            var fuzzy: fuzzy_type = std.math.cast(fuzzy_type, entry.style.len) orelse
+                std.math.maxInt(fuzzy_type);
+            for (desired_styles) |s| {
+                if (std.ascii.indexOfIgnoreCase(entry.style, s) != null) {
+                    fuzzy -|= std.math.cast(fuzzy_type, s.len) orelse
+                        std.math.maxInt(fuzzy_type);
+                }
+            }
+            self.fuzzy_style = std.math.maxInt(fuzzy_type) -| fuzzy;
+
+            const target: i32 = if (desc.bold) 700 else 400;
+            const diff: u32 = @abs(@as(i32, entry.weight) - target);
+            self.weight = @intCast(std.math.maxInt(u10) - @min(diff, std.math.maxInt(u10)));
+
+            return self;
+        }
+    };
 
     pub const DiscoverIterator = struct {
         alloc: Allocator,
         lib: Library,
-        desc: Descriptor,
+        entries: []const Entry,
+        candidates: []const Candidate,
+        codepoint: u32,
         variations: []const Variation,
-        state: State,
-        dir: ?std.Io.Dir,
-        iter: ?std.Io.Dir.Iterator,
-        system_path: ?[:0]const u8,
-        user_path: ?[:0]const u8,
-
-        const State = enum { system, user, done };
+        i: usize = 0,
 
         pub fn deinit(self: *DiscoverIterator) void {
-            if (self.dir) |*d| d.close(global.io());
-            if (self.system_path) |p| self.alloc.free(p);
-            if (self.user_path) |p| self.alloc.free(p);
+            self.alloc.free(self.candidates);
             self.* = undefined;
         }
 
         pub fn next(self: *DiscoverIterator) !?DeferredFace {
-            while (true) {
-                // Ensure we have a directory iterator for the current state.
-                if (self.iter == null) {
-                    switch (self.state) {
-                        .system => {
-                            const path = self.systemFontsPath() orelse {
-                                self.state = .user;
-                                continue;
-                            };
-                            self.system_path = path;
-                            self.dir = std.Io.Dir.openDirAbsolute(
-                                global.io(),
-                                path,
-                                .{ .iterate = true },
-                            ) catch {
-                                self.state = .user;
-                                continue;
-                            };
-                            self.iter = self.dir.?.iterate();
-                        },
-                        .user => {
-                            const path = self.userFontsPath() orelse {
-                                self.state = .done;
-                                continue;
-                            };
-                            self.user_path = path;
-                            self.dir = std.Io.Dir.openDirAbsolute(
-                                global.io(),
-                                path,
-                                .{ .iterate = true },
-                            ) catch {
-                                self.state = .done;
-                                continue;
-                            };
-                            self.iter = self.dir.?.iterate();
-                        },
-                        .done => return null,
-                    }
-                }
+            while (self.i < self.candidates.len) {
+                const entry = &self.entries[self.candidates[self.i].entry];
+                self.i += 1;
 
-                const entry = (self.iter.?.next(global.io()) catch null) orelse {
-                    // Finished this directory; advance state.
-                    if (self.dir) |*d| d.close(global.io());
-                    self.dir = null;
-                    self.iter = null;
-                    self.state = switch (self.state) {
-                        .system => .user,
-                        .user => .done,
-                        .done => .done,
-                    };
+                const peek = self.openPeek(entry) orelse continue;
+                if (self.codepoint != 0 and peek.getCharIndex(self.codepoint) == null) {
+                    self.closePeek(peek);
                     continue;
-                };
-
-                if (entry.kind != .file) continue;
-                if (!isFontFile(entry.name)) continue;
-
-                if (try self.tryMatch(entry.name)) |face| return face;
-            }
-        }
-
-        /// Build the system fonts directory from %SYSTEMROOT%. Returns null
-        /// if SYSTEMROOT is unset, which shouldn't happen on a healthy
-        /// Windows install but we just skip the directory rather than
-        /// falling back to a hardcoded drive letter.
-        fn systemFontsPath(self: *DiscoverIterator) ?[:0]const u8 {
-            const systemroot = global.environ().getAlloc(
-                self.alloc,
-                "SYSTEMROOT",
-            ) catch return null;
-            defer self.alloc.free(systemroot);
-            return std.fmt.allocPrintSentinel(
-                self.alloc,
-                "{s}\\Fonts",
-                .{systemroot},
-                0,
-            ) catch null;
-        }
-
-        fn userFontsPath(self: *DiscoverIterator) ?[:0]const u8 {
-            const local_appdata = global.environ().getAlloc(
-                self.alloc,
-                "LOCALAPPDATA",
-            ) catch return null;
-            defer self.alloc.free(local_appdata);
-            return std.fmt.allocPrintSentinel(
-                self.alloc,
-                "{s}\\Microsoft\\Windows\\Fonts",
-                .{local_appdata},
-                0,
-            ) catch null;
-        }
-
-        fn tryMatch(
-            self: *DiscoverIterator,
-            name: []const u8,
-        ) !?DeferredFace {
-            const dir_path = switch (self.state) {
-                .system => self.system_path.?,
-                .user => self.user_path.?,
-                .done => return null,
-            };
-
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const full_path = std.fmt.bufPrintZ(
-                &path_buf,
-                "{s}\\{s}",
-                .{ dir_path, name },
-            ) catch return null;
-
-            const is_ttc = std.ascii.endsWithIgnoreCase(name, ".ttc");
-            const max_faces: i32 = if (is_ttc) 16 else 1;
-
-            // Probe each face in the file.
-            var face_index: i32 = 0;
-            while (face_index < max_faces) : (face_index += 1) {
-                var face = Face.initFile(
-                    self.lib,
-                    full_path,
-                    face_index,
-                    .{ .size = .{ .points = 12 } },
-                ) catch break;
-
-                if (self.matches(&face)) {
-                    return try self.makeDeferred(face, full_path, face_index);
                 }
 
-                face.deinit();
+                return DeferredFace{
+                    .win = .{
+                        .lib = self.lib,
+                        .path = entry.path,
+                        .face_index = entry.face_index,
+                        .family = entry.family,
+                        .name = entry.full_name,
+                        .variations = self.variations,
+                        .peek = peek,
+                        .presentation = if (entry.color) .emoji else .text,
+                    },
+                };
             }
 
             return null;
         }
 
-        /// Check whether the given face matches the descriptor.
-        fn matches(self: *const DiscoverIterator, face: *Face) bool {
-            if (self.desc.family) |family| {
-                if (!familyMatches(face, family)) return false;
-            }
-            if (self.desc.codepoint != 0) {
-                if (face.glyphIndex(self.desc.codepoint) == null) return false;
-            }
-            return true;
+        fn openPeek(self: *DiscoverIterator, entry: *const Entry) ?freetype.Face {
+            self.lib.mutex.lockUncancelable(global.io());
+            defer self.lib.mutex.unlock(global.io());
+            const face = self.lib.lib.initFace(entry.path, entry.face_index) catch
+                return null;
+            face.selectCharmap(.unicode) catch {
+                face.deinit();
+                return null;
+            };
+            return face;
         }
 
-        fn makeDeferred(
-            self: *DiscoverIterator,
-            face: Face,
-            full_path: []const u8,
-            face_index: i32,
-        ) !DeferredFace {
-            const path_owned = try self.alloc.dupeZ(u8, full_path);
-            errdefer self.alloc.free(path_owned);
+        fn closePeek(self: *DiscoverIterator, face: freetype.Face) void {
+            self.lib.mutex.lockUncancelable(global.io());
+            defer self.lib.mutex.unlock(global.io());
+            face.deinit();
+        }
+    };
 
-            const presentation: Presentation =
-                if (face.hasColor()) .emoji else .text;
+    const Coverage = struct {
+        const pages = 0x40000 >> 8;
 
-            return DeferredFace{
-                .win = .{
-                    .path = path_owned,
-                    .face_index = face_index,
-                    .variations = self.variations,
-                    .peek = face,
-                    .presentation = presentation,
-                    .alloc = self.alloc,
-                },
+        set: std.StaticBitSet(pages) = .initEmpty(),
+        high: bool = false,
+
+        fn mayHave(self: *const Coverage, cp: u32) bool {
+            if (cp >= 0x40000) return self.high;
+            return self.set.isSet(cp >> 8);
+        }
+    };
+
+    const Entry = struct {
+        path: [:0]const u8,
+        face_index: i32,
+        family: []const u8,
+        alt_names: []const []const u8,
+        style: []const u8,
+        full_name: []const u8,
+        weight: u16,
+        bold: bool,
+        italic: bool,
+        monospace: bool,
+        variable: bool,
+        color: bool,
+        coverage: *const Coverage,
+
+        fn hasAltName(self: *const Entry, name: []const u8) bool {
+            for (self.alt_names) |n| {
+                if (std.ascii.eqlIgnoreCase(n, name)) return true;
+            }
+            return false;
+        }
+    };
+
+    const Locale = enum { other, ja, zh_hans, zh_hant, ko };
+
+    const Index = struct {
+        entries: []const Entry,
+        locale: Locale,
+
+        var mutex: std.Io.Mutex = .init;
+        var instance: ?Index = null;
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+        fn get() !*const Index {
+            mutex.lockUncancelable(global.io());
+            defer mutex.unlock(global.io());
+            if (instance) |*v| return v;
+            instance = try build(arena.allocator());
+            return &instance.?;
+        }
+
+        fn build(alloc: Allocator) !Index {
+            const io = global.io();
+            const start = std.Io.Timestamp.now(io, .awake);
+
+            const ft = try freetype.Library.init();
+            defer ft.deinit();
+
+            var paths: PathSet = .{};
+            const system_dir = fontsDir(alloc, "SYSTEMROOT", "\\Fonts");
+            const user_dir = fontsDir(alloc, "LOCALAPPDATA", "\\Microsoft\\Windows\\Fonts");
+            if (system_dir) |dir| try paths.addDir(alloc, dir);
+            if (user_dir) |dir| try paths.addDir(alloc, dir);
+            try paths.addRegistry(alloc, hkey_local_machine, system_dir);
+            try paths.addRegistry(alloc, hkey_current_user, system_dir);
+
+            std.mem.sort([:0]const u8, paths.list.items, {}, struct {
+                fn lessThan(_: void, a: [:0]const u8, b: [:0]const u8) bool {
+                    return std.ascii.lessThanIgnoreCase(a, b);
+                }
+            }.lessThan);
+
+            var entries: std.ArrayList(Entry) = .empty;
+            for (paths.list.items) |path| try indexFile(alloc, ft, path, &entries);
+
+            const elapsed = start.durationTo(std.Io.Timestamp.now(io, .awake));
+            log.info("indexed {d} font faces from {d} files in {d}ms", .{
+                entries.items.len,
+                paths.list.items.len,
+                @divTrunc(elapsed.toNanoseconds(), std.time.ns_per_ms),
+            });
+
+            return .{
+                .entries = try entries.toOwnedSlice(alloc),
+                .locale = userLocale(),
             };
+        }
+
+        fn fontsDir(alloc: Allocator, env: []const u8, suffix: []const u8) ?[]const u8 {
+            const base = global.environ().getAlloc(alloc, env) catch return null;
+            return std.mem.concat(alloc, u8, &.{ base, suffix }) catch null;
+        }
+
+        fn indexFile(
+            alloc: Allocator,
+            ft: freetype.Library,
+            path: [:0]const u8,
+            entries: *std.ArrayList(Entry),
+        ) Allocator.Error!void {
+            var num_faces: i32 = 1;
+            var i: i32 = 0;
+            while (i < num_faces) : (i += 1) {
+                const face = ft.initFace(path, i) catch continue;
+                defer face.deinit();
+                if (i == 0) num_faces = std.math.cast(i32, face.handle.*.num_faces) orelse 1;
+                face.selectCharmap(.unicode) catch continue;
+
+                const coverage = try buildCoverage(alloc, face);
+                const instances: i32 = @intCast((face.handle.*.style_flags >> 16) & 0x7FFF);
+                if (instances == 0) {
+                    try addEntry(alloc, ft, face, path, i, false, coverage, entries);
+                    continue;
+                }
+
+                var n: i32 = 1;
+                while (n <= instances) : (n += 1) {
+                    const inst_index = (n << 16) | i;
+                    const inst = ft.initFace(path, inst_index) catch continue;
+                    defer inst.deinit();
+                    try addEntry(alloc, ft, inst, path, inst_index, true, coverage, entries);
+                }
+            }
+        }
+
+        fn buildCoverage(alloc: Allocator, face: freetype.Face) Allocator.Error!*const Coverage {
+            const cov = try alloc.create(Coverage);
+            cov.* = .{};
+            var gindex: freetype.c.FT_UInt = 0;
+            var cp = freetype.c.FT_Get_First_Char(face.handle, &gindex);
+            while (gindex != 0) {
+                if (cp >= 0x40000) {
+                    cov.high = true;
+                    break;
+                }
+                const page: usize = @intCast(cp >> 8);
+                cov.set.set(page);
+                cp = freetype.c.FT_Get_Next_Char(face.handle, cp | 0xFF, &gindex);
+            }
+            return cov;
+        }
+
+        fn addEntry(
+            alloc: Allocator,
+            ft: freetype.Library,
+            face: freetype.Face,
+            path: [:0]const u8,
+            face_index: i32,
+            named_instance: bool,
+            coverage: *const Coverage,
+            entries: *std.ArrayList(Entry),
+        ) Allocator.Error!void {
+            const rec = face.handle.*;
+            const family_c = rec.family_name orelse return;
+            const family = try alloc.dupe(u8, std.mem.span(family_c));
+            const style = if (rec.style_name) |s|
+                try alloc.dupe(u8, std.mem.span(s))
+            else
+                "Regular";
+
+            var weight: u16 = 400;
+            var bold = rec.style_flags & freetype.c.FT_STYLE_FLAG_BOLD != 0;
+            var italic = rec.style_flags & freetype.c.FT_STYLE_FLAG_ITALIC != 0;
+            var monospace = rec.face_flags & freetype.c.FT_FACE_FLAG_FIXED_WIDTH != 0;
+
+            if (face.getSfntTable(.os2)) |os2| {
+                if (os2.version != 0xFFFF) {
+                    weight = os2.usWeightClass;
+                    if (weight > 0 and weight < 10) weight *= 100;
+                    bold = bold or os2.fsSelection & 0x20 != 0;
+                    italic = italic or os2.fsSelection & 0x201 != 0;
+                    monospace = monospace or (os2.panose[0] == 2 and os2.panose[3] == 9);
+                }
+            }
+            if (face.getSfntTable(.head)) |head| {
+                bold = bold or head.Mac_Style & 1 != 0;
+                italic = italic or head.Mac_Style & 2 != 0;
+            }
+            if (weight == 0) weight = if (bold) 700 else 400;
+
+            if (named_instance) instance: {
+                const mm = face.getMMVar() catch break :instance;
+                defer ft.doneMMVar(mm);
+                var coords_buf: [32]freetype.c.FT_Fixed = undefined;
+                const coords = coords_buf[0..@min(coords_buf.len, mm.*.num_axis)];
+                face.getVarDesignCoordinates(coords) catch break :instance;
+
+                var ital_seen = false;
+                for (coords, 0..) |coord, j| {
+                    const value: f64 = @as(f64, @floatFromInt(coord)) / 65536.0;
+                    const tag = mm.*.axis[j].tag;
+                    if (tag == axisTag("wght")) {
+                        weight = std.math.lossyCast(u16, value);
+                        bold = value > 600;
+                    } else if (tag == axisTag("ital")) {
+                        italic = value > 0.5;
+                        ital_seen = true;
+                    } else if (!ital_seen and tag == axisTag("slnt")) {
+                        italic = value <= -5.0;
+                    }
+                }
+            }
+
+            var alt_names: std.ArrayList([]const u8) = .empty;
+            var full_name: ?[]const u8 = null;
+            const count = face.getSfntNameCount();
+            for (0..count) |j| {
+                const entry = face.getSfntName(j) catch continue;
+                if (entry.platform_id != freetype.c.TT_PLATFORM_MICROSOFT) continue;
+                if (entry.encoding_id != freetype.c.TT_MS_ID_UNICODE_CS and
+                    entry.encoding_id != freetype.c.TT_MS_ID_UCS_4) continue;
+                const is_family = entry.name_id == freetype.c.TT_NAME_ID_FONT_FAMILY or
+                    entry.name_id == freetype.c.TT_NAME_ID_TYPOGRAPHIC_FAMILY;
+                const is_full = entry.name_id == freetype.c.TT_NAME_ID_FULL_NAME and
+                    entry.language_id == 0x409;
+                if (!is_family and !is_full) continue;
+
+                const value = decodeUtf16Be(alloc, entry.string[0..entry.string_len]) orelse
+                    continue;
+                if (is_full) {
+                    if (full_name == null) full_name = value;
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(value, family)) continue;
+                for (alt_names.items) |existing| {
+                    if (std.ascii.eqlIgnoreCase(existing, value)) break;
+                } else try alt_names.append(alloc, value);
+            }
+
+            const name = if (named_instance or full_name == null)
+                try std.fmt.allocPrint(alloc, "{s} {s}", .{ family, style })
+            else
+                full_name.?;
+
+            try entries.append(alloc, .{
+                .path = path,
+                .face_index = face_index,
+                .family = family,
+                .alt_names = try alt_names.toOwnedSlice(alloc),
+                .style = style,
+                .full_name = name,
+                .weight = weight,
+                .bold = bold,
+                .italic = italic,
+                .monospace = monospace,
+                .variable = face.hasMultipleMasters(),
+                .color = face.hasColor(),
+                .coverage = coverage,
+            });
+        }
+
+        fn axisTag(comptime s: *const [4]u8) freetype.c.FT_ULong {
+            return std.mem.readInt(u32, s, .big);
+        }
+
+        fn decodeUtf16Be(alloc: Allocator, bytes: []const u8) ?[]const u8 {
+            if (bytes.len == 0 or bytes.len % 2 != 0) return null;
+            var buf: [512]u16 = undefined;
+            const len = @min(buf.len, bytes.len / 2);
+            for (0..len) |k| buf[k] = std.mem.readInt(u16, bytes[k * 2 ..][0..2], .big);
+            return std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..len]) catch null;
+        }
+    };
+
+    const PathSet = struct {
+        list: std.ArrayList([:0]const u8) = .empty,
+        seen: std.StringHashMapUnmanaged(void) = .empty,
+
+        fn add(self: *PathSet, alloc: Allocator, path: [:0]const u8) Allocator.Error!void {
+            if (!isFontFile(path)) return;
+            const key = try std.ascii.allocLowerString(alloc, path);
+            const gop = try self.seen.getOrPut(alloc, key);
+            if (gop.found_existing) return;
+            try self.list.append(alloc, path);
+        }
+
+        fn addDir(self: *PathSet, alloc: Allocator, dir_path: []const u8) Allocator.Error!void {
+            const io = global.io();
+            var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch
+                return;
+            defer dir.close(io);
+            var it = dir.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                const path = try std.fmt.allocPrintSentinel(
+                    alloc,
+                    "{s}\\{s}",
+                    .{ dir_path, entry.name },
+                    0,
+                );
+                try self.add(alloc, path);
+            }
+        }
+
+        fn addRegistry(
+            self: *PathSet,
+            alloc: Allocator,
+            root: HKEY,
+            system_dir: ?[]const u8,
+        ) Allocator.Error!void {
+            var key: HKEY = undefined;
+            if (RegOpenKeyExW(
+                root,
+                std.unicode.utf8ToUtf16LeStringLiteral("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"),
+                0,
+                key_read,
+                &key,
+            ) != 0) return;
+            defer _ = RegCloseKey(key);
+
+            var name_buf: [1024]u16 = undefined;
+            var data_buf: [1024]u16 = undefined;
+            var i: u32 = 0;
+            while (true) : (i += 1) {
+                var name_len: u32 = name_buf.len;
+                var data_len: u32 = @sizeOf(@TypeOf(data_buf));
+                var value_type: u32 = 0;
+                const rc = RegEnumValueW(
+                    key,
+                    i,
+                    &name_buf,
+                    &name_len,
+                    null,
+                    &value_type,
+                    @ptrCast(&data_buf),
+                    &data_len,
+                );
+                if (rc == error_no_more_items) break;
+                if (rc != 0) continue;
+                if (value_type != reg_sz) continue;
+
+                var chars: []const u16 = data_buf[0 .. data_len / 2];
+                while (chars.len > 0 and chars[chars.len - 1] == 0) chars = chars[0 .. chars.len - 1];
+                if (chars.len == 0) continue;
+
+                const file = std.unicode.utf16LeToUtf8Alloc(alloc, chars) catch continue;
+                const absolute = (file.len >= 2 and file[1] == ':') or
+                    std.mem.startsWith(u8, file, "\\\\");
+                const path = if (absolute)
+                    try alloc.dupeZ(u8, file)
+                else if (system_dir) |dir|
+                    try std.fmt.allocPrintSentinel(alloc, "{s}\\{s}", .{ dir, file }, 0)
+                else
+                    continue;
+                try self.add(alloc, path);
+            }
         }
     };
 
     fn isFontFile(name: []const u8) bool {
         return std.ascii.endsWithIgnoreCase(name, ".ttf") or
             std.ascii.endsWithIgnoreCase(name, ".ttc") or
-            std.ascii.endsWithIgnoreCase(name, ".otf");
+            std.ascii.endsWithIgnoreCase(name, ".otf") or
+            std.ascii.endsWithIgnoreCase(name, ".otc");
     }
 
-    /// Compare a face's family against a requested family name. Checks
-    /// FreeType's family_name first, then falls back to the SFNT name
-    /// table entry.
-    fn familyMatches(face: *Face, family: [:0]const u8) bool {
-        const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
-        if (ft_family) |f| {
-            if (std.ascii.eqlIgnoreCase(std.mem.span(f), family)) return true;
+    fn userLocale() Locale {
+        var buf: [85]u16 = undefined;
+        const n = GetUserDefaultLocaleName(&buf, buf.len);
+        if (n <= 1) return .other;
+        var ascii: [85]u8 = undefined;
+        const len: usize = @intCast(n - 1);
+        for (buf[0..len], 0..) |c, i| ascii[i] = if (c < 0x80) @intCast(c) else '?';
+        const name = ascii[0..len];
+
+        if (std.ascii.startsWithIgnoreCase(name, "ja")) return .ja;
+        if (std.ascii.startsWithIgnoreCase(name, "ko")) return .ko;
+        if (std.ascii.startsWithIgnoreCase(name, "zh")) {
+            for ([_][]const u8{ "-TW", "-HK", "-MO", "-Hant" }) |suffix| {
+                if (std.ascii.indexOfIgnoreCase(name, suffix) != null) return .zh_hant;
+            }
+            return .zh_hans;
         }
-        var buf: [256]u8 = undefined;
-        const sfnt = face.name(&buf) catch "";
-        return sfnt.len > 0 and std.ascii.eqlIgnoreCase(sfnt, family);
+        return .other;
     }
+
+    fn curatedFallback(cp: u32, locale: Locale) []const []const u8 {
+        if (cp >= 0x1F000 and cp <= 0x1FAFF)
+            return &.{ "Segoe UI Emoji", "Segoe UI Symbol" };
+        if ((cp >= 0x2000 and cp <= 0x2BFF) or (cp >= 0x1D400 and cp <= 0x1D7FF))
+            return &.{ "Segoe UI Symbol", "Segoe UI Emoji", "Cambria Math" };
+        if ((cp >= 0x1100 and cp <= 0x11FF) or
+            (cp >= 0x3130 and cp <= 0x318F) or
+            (cp >= 0xAC00 and cp <= 0xD7FF))
+            return &.{ "Malgun Gothic", "Gulim" };
+        if ((cp >= 0x2E80 and cp <= 0x9FFF) or
+            (cp >= 0xF900 and cp <= 0xFAFF) or
+            (cp >= 0xFE30 and cp <= 0xFE4F) or
+            (cp >= 0xFF00 and cp <= 0xFFEF) or
+            (cp >= 0x20000 and cp <= 0x3FFFF))
+        {
+            return switch (locale) {
+                .ja => &.{ "Yu Gothic UI", "Meiryo UI", "MS Gothic", "Microsoft YaHei UI", "Microsoft JhengHei UI", "Malgun Gothic", "SimSun", "SimSun-ExtB", "SimSun-ExtG" },
+                .zh_hans => &.{ "Microsoft YaHei UI", "SimSun", "Yu Gothic UI", "Microsoft JhengHei UI", "Malgun Gothic", "SimSun-ExtB", "SimSun-ExtG" },
+                .zh_hant => &.{ "Microsoft JhengHei UI", "MingLiU", "Microsoft YaHei UI", "Yu Gothic UI", "Malgun Gothic", "MingLiU-ExtB", "SimSun-ExtG" },
+                .ko => &.{ "Malgun Gothic", "Yu Gothic UI", "Microsoft YaHei UI", "Microsoft JhengHei UI", "SimSun-ExtB", "SimSun-ExtG" },
+                .other => &.{ "Yu Gothic UI", "Microsoft YaHei UI", "Microsoft JhengHei UI", "Malgun Gothic", "SimSun", "MS Gothic", "SimSun-ExtB", "SimSun-ExtG" },
+            };
+        }
+        if ((cp >= 0x0900 and cp <= 0x0DFF) or (cp >= 0x1CD0 and cp <= 0x1CFF) or (cp >= 0xA8E0 and cp <= 0xA8FF))
+            return &.{ "Nirmala UI", "Nirmala Text" };
+        if (cp >= 0x0E00 and cp <= 0x0EFF)
+            return &.{ "Leelawadee UI", "Leelawadee" };
+        if ((cp >= 0x1200 and cp <= 0x139F) or (cp >= 0x2D80 and cp <= 0x2DDF))
+            return &.{ "Ebrima", "Nyala" };
+        if ((cp >= 0x0590 and cp <= 0x08FF) or
+            (cp >= 0xFB1D and cp <= 0xFDFF) or
+            (cp >= 0xFE70 and cp <= 0xFEFF))
+            return &.{ "Segoe UI", "Tahoma" };
+        return &.{};
+    }
+
+    const HKEY = *opaque {};
+    // Predefined HKEYs are sign-extended 32-bit values on 64-bit Windows.
+    const hkey_current_user: HKEY = @ptrFromInt(@as(usize, @bitCast(@as(isize, @as(i32, @bitCast(@as(u32, 0x80000001)))))));
+    const hkey_local_machine: HKEY = @ptrFromInt(@as(usize, @bitCast(@as(isize, @as(i32, @bitCast(@as(u32, 0x80000002)))))));
+    const key_read: u32 = 0x20019;
+    const reg_sz: u32 = 1;
+    const error_no_more_items: i32 = 259;
+
+    extern "advapi32" fn RegOpenKeyExW(
+        hKey: HKEY,
+        lpSubKey: [*:0]const u16,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *HKEY,
+    ) callconv(.winapi) i32;
+    extern "advapi32" fn RegEnumValueW(
+        hKey: HKEY,
+        dwIndex: u32,
+        lpValueName: [*]u16,
+        lpcchValueName: *u32,
+        lpReserved: ?*u32,
+        lpType: ?*u32,
+        lpData: ?[*]u8,
+        lpcbData: ?*u32,
+    ) callconv(.winapi) i32;
+    extern "advapi32" fn RegCloseKey(hKey: HKEY) callconv(.winapi) i32;
+    extern "kernel32" fn GetUserDefaultLocaleName(
+        lpLocaleName: [*]u16,
+        cchLocaleName: i32,
+    ) callconv(.winapi) i32;
 };
 
 test "descriptor hash" {
@@ -1413,4 +1816,175 @@ test "windows" {
     var face = (try it.next()) orelse return error.TestFontNotFound;
     defer face.deinit();
     try testing.expect(face.hasCodepoint('A', null));
+}
+
+test "windows bold style" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var win = Windows.init(lib);
+    defer win.deinit();
+
+    var it = try win.discover(alloc, .{ .family = "Arial", .size = 12, .bold = true });
+    defer it.deinit();
+
+    var face = (try it.next()) orelse return error.TestFontNotFound;
+    defer face.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Arial", try face.familyName(&buf));
+    try testing.expectEqualStrings("Arial Bold", try face.name(&buf));
+}
+
+test "windows emoji fallback" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var win = Windows.init(lib);
+    defer win.deinit();
+
+    var it = try win.search(alloc, .{ .codepoint = 0x1F600, .size = 12 }, true);
+    defer it.deinit();
+
+    var face = (try it.next()) orelse return error.TestFontNotFound;
+    defer face.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Segoe UI Emoji", try face.familyName(&buf));
+    try testing.expect(face.hasCodepoint(0x1F600, .emoji));
+}
+
+test "windows monospace and collections" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const index = try Windows.Index.get();
+
+    var consolas = false;
+    var gothic_faces: usize = 0;
+    for (index.entries) |entry| {
+        if (std.mem.eql(u8, entry.family, "Consolas")) {
+            try testing.expect(entry.monospace);
+            consolas = true;
+        }
+        if (std.ascii.endsWithIgnoreCase(entry.path, "\\msgothic.ttc")) gothic_faces += 1;
+    }
+    try testing.expect(consolas);
+    if (gothic_faces > 0) try testing.expect(gothic_faces > 1);
+}
+
+test "windows cjk and symbol fallback" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var win = Windows.init(lib);
+    defer win.deinit();
+
+    const index = try Windows.Index.get();
+    const cjk: ?[]const u8 = switch (index.locale) {
+        .other, .ja => "Yu Gothic UI",
+        else => null,
+    };
+    const cases = [_]struct { u32, ?[]const u8 }{
+        .{ 0x65E5, cjk },
+        .{ 0x2211, "Segoe UI Symbol" },
+        .{ 0x279C, "Segoe UI Symbol" },
+    };
+    for (cases) |case| {
+        const cp, const expected = case;
+        var it = try win.search(alloc, .{ .codepoint = cp, .size = 12 }, true);
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        try testing.expect(face.hasCodepoint(cp, null));
+        var buf: [256]u8 = undefined;
+        if (expected) |family| try testing.expectEqualStrings(family, try face.familyName(&buf));
+    }
+}
+
+test "windows variable named instance" {
+    if (options.backend != .freetype_windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var win = Windows.init(lib);
+    defer win.deinit();
+
+    {
+        var it = try win.discover(alloc, .{ .family = "Cascadia Mono", .size = 12, .bold = true });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.SkipZigTest;
+        defer face.deinit();
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings("Cascadia Mono Bold", try face.name(&buf));
+
+        var regular_it = try win.discover(alloc, .{ .family = "Cascadia Mono", .size = 12 });
+        defer regular_it.deinit();
+        var regular = (try regular_it.next()) orelse return error.TestFontNotFound;
+        defer regular.deinit();
+        try testing.expectEqualStrings("Cascadia Mono Regular", try regular.name(&buf));
+
+        const bold_ink = try testInk(alloc, lib, &face, 'l');
+        const regular_ink = try testInk(alloc, lib, &regular, 'l');
+        try testing.expect(bold_ink > regular_ink + regular_ink / 4);
+    }
+
+    {
+        const variations: []const Variation = &.{.{ .id = .init("wght"), .value = 600 }};
+        var it = try win.discover(alloc, .{
+            .family = "Cascadia Mono",
+            .size = 12,
+            .variations = variations,
+        });
+        defer it.deinit();
+        var deferred = (try it.next()) orelse return error.SkipZigTest;
+        defer deferred.deinit();
+        var face = try deferred.load(lib, .{ .size = .{ .points = 12 } });
+        defer face.deinit();
+
+        const mm = try face.face.getMMVar();
+        defer lib.lib.doneMMVar(mm);
+        var coords: [32]Windows.freetype.c.FT_Fixed = undefined;
+        const n = @min(coords.len, mm.*.num_axis);
+        try face.face.getVarDesignCoordinates(coords[0..n]);
+        for (0..n) |i| {
+            if (mm.*.axis[i].tag == std.mem.readInt(u32, "wght", .big)) {
+                try testing.expectEqual(@as(i64, 600), @divTrunc(coords[i], 65536));
+            }
+        }
+    }
+}
+
+fn testInk(alloc: Allocator, lib: Library, deferred: *DeferredFace, cp: u32) !u64 {
+    const font = @import("main.zig");
+    var face = try deferred.load(lib, .{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } });
+    defer face.deinit();
+    var atlas = try font.Atlas.init(alloc, 128, .grayscale);
+    defer atlas.deinit(alloc);
+    _ = try face.renderGlyph(
+        alloc,
+        &atlas,
+        face.glyphIndex(cp).?,
+        .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
+    );
+    var sum: u64 = 0;
+    for (atlas.data) |v| sum += v;
+    return sum;
 }

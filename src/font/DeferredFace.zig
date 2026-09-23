@@ -10,7 +10,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fontconfig = @import("fontconfig");
 const macos = @import("macos");
+const freetype = @import("freetype");
 const font = @import("main.zig");
+const global = @import("../global.zig");
 const options = @import("main.zig").options;
 const Library = @import("main.zig").Library;
 const Face = @import("main.zig").Face;
@@ -56,37 +58,23 @@ pub const Fontconfig = struct {
 };
 
 /// Windows specific data. Only present with the freetype_windows backend.
-///
-/// Unlike Fontconfig/CoreText which carry lightweight descriptor handles,
-/// the Windows backend has no external descriptor service — the "deferred"
-/// metadata is the FreeType face itself. We keep a pre-loaded face (loaded
-/// at discovery time) to answer `hasCodepoint` cheaply without re-opening
-/// the file on every query, and remember the path so `load()` can open a
-/// fresh face at the caller's requested size/options.
+/// `path`, `family` and `name` are owned by the process-global font index
+/// in discovery.zig and are never freed here.
 pub const Windows = struct {
-    /// Path to the font file. Owned here.
+    lib: Library,
     path: [:0]const u8,
-
-    /// Face index within the file (for .ttc collections).
     face_index: i32,
-
-    /// Variations to apply on load.
+    family: []const u8,
+    name: []const u8,
     variations: []const font.face.Variation,
-
-    /// Pre-loaded face used for cheap metadata queries (glyphIndex,
-    /// hasColor). The size it was opened at is irrelevant for these
-    /// queries since the CMap is size-independent. Deinit'd with us.
-    peek: Face,
-
-    /// Whether the face presents as emoji (has color glyphs) or text.
+    peek: freetype.Face,
     presentation: Presentation,
 
-    /// Allocator that owns `path`.
-    alloc: Allocator,
-
     pub fn deinit(self: *Windows) void {
+        const mutex = self.lib.mutex;
+        mutex.lockUncancelable(global.io());
+        defer mutex.unlock(global.io());
         self.peek.deinit();
-        self.alloc.free(self.path);
         self.* = undefined;
     }
 };
@@ -144,7 +132,7 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
 
-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+        .freetype_windows => if (self.win) |w| return w.family,
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.family, 0)).string,
@@ -174,7 +162,7 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
 
-        .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+        .freetype_windows => if (self.win) |w| return w.name,
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.fullname, 0)).string,
@@ -351,7 +339,7 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
             // Use the pre-loaded peek face for a cheap CMap lookup.
             if (self.win) |w| {
                 if (p) |desired| if (w.presentation != desired) return false;
-                return w.peek.glyphIndex(cp) != null;
+                return w.peek.getCharIndex(cp) != null;
             }
         },
 

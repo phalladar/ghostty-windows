@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const objc = @import("objc");
+const windows = @import("windows.zig");
 
 const log = std.log.scoped(.os);
 
@@ -19,6 +20,8 @@ pub fn clickInterval() ?u32 {
             const ms = @as(u32, @intFromFloat(@ceil(interval * 1000)));
             break :macos ms;
         },
+
+        .windows => windows.exp.user32.GetDoubleClickTime(),
 
         else => null,
     };

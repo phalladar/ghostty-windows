@@ -216,17 +216,19 @@ pub fn add(
     // POSIX C imports that are used throughout Ghostty on a general basis.
     // (note: errno is C stdlib but we just include it here because that's
     // where it's generally included otherwise)
-    try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
-        .source = .{ .includes = .{ .files = &.{
-            .{ .path = "errno.h" },
-            .{ .path = "pwd.h" },
-            .{ .path = "signal.h" },
-            .{ .path = "sys/types.h" },
-            .{ .path = "unistd.h" },
-        } } },
-        .target = target,
-        .optimize = optimize,
-    });
+    if (target.result.os.tag != .windows) {
+        try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "errno.h" },
+                .{ .path = "pwd.h" },
+                .{ .path = "signal.h" },
+                .{ .path = "sys/types.h" },
+                .{ .path = "unistd.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+        });
+    }
 
     // Freetype. We always include this even if our font backend doesn't
     // use it because Dear Imgui uses Freetype.
@@ -691,6 +693,16 @@ pub fn add(
         switch (self.config.app_runtime) {
             .none => {},
             .gtk => try self.addGtkNg(step),
+            .win32 => {
+                step.root_module.linkSystemLibrary("user32", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("gdi32", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("shell32", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("ole32", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("dwmapi", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("shcore", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("imm32", dynamic_link_opts);
+                step.root_module.linkSystemLibrary("opengl32", dynamic_link_opts);
+            },
         }
     }
 

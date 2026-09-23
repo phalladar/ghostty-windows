@@ -64,11 +64,10 @@ pub fn complete(self: *const Self, sync: bool) void {
     // Then sync before exporting and pushing to the present queue.
     // The apprt pulls from this queue in its snapshot handler.
     const presented_frame: ?OpenGL.ExportedFrame = if (health == .healthy) frame: {
-        const frame = self.renderer.api.present(self.target.*) catch |err| {
+        break :frame self.renderer.api.present(self.target.*) catch |err| {
             log.warn("failed to present render target: err={}", .{err});
             break :frame null;
         };
-        break :frame frame;
     } else null;
 
     // Sync after frame draw AND frame present GL calls.

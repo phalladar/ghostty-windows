@@ -47,6 +47,7 @@ pub const isFlatpak = flatpak.isFlatpak;
 pub const FlatpakHostCommand = flatpak.FlatpakHostCommand;
 pub const home = homedir.home;
 pub const expandHome = homedir.expandHome;
+pub const hasHomePrefix = homedir.hasHomePrefix;
 pub const ensureLocale = locale.ensureLocale;
 pub const clickInterval = mouse.clickInterval;
 pub const open = openpkg.open;
@@ -63,12 +64,16 @@ test {
     _ = stderr;
     _ = edit;
     _ = i18n;
+    _ = locale;
+    _ = hostname;
     _ = path;
     _ = uri;
     _ = shell;
 
     if (comptime builtin.os.tag == .linux) {
         _ = kernel_info;
+    } else if (comptime builtin.os.tag == .windows) {
+        _ = openpkg;
     } else if (comptime builtin.os.tag.isDarwin()) {
         _ = mach;
         _ = macos;

@@ -58,6 +58,17 @@ pub fn preferredXdgPath(alloc: Allocator) ![]const u8 {
     return xdg_path;
 }
 
+pub const windows_legacy_names: []const []const u8 = &.{ "config", "config.ghostty" };
+
+pub fn windowsLegacyPath(alloc: Allocator, name: []const u8) !?[]const u8 {
+    var environ_map = try global.environMap();
+    defer environ_map.deinit();
+    if (environ_map.get("XDG_CONFIG_HOME")) |v| if (v.len > 0) return null;
+    const local = environ_map.get("LOCALAPPDATA") orelse return null;
+    if (local.len == 0) return null;
+    return try std.fs.path.join(alloc, &.{ local, "ghostty", name });
+}
+
 /// Default path for the macOS Application Support configuration file.
 /// Returned value must be freed by the caller.
 pub fn defaultAppSupportPath(alloc: Allocator) ![]const u8 {
@@ -122,6 +133,26 @@ pub fn preferredDefaultFilePath(alloc: Allocator) ![]const u8 {
             };
             app_support_file.close(global.io());
             return app_support_path;
+        },
+
+        .windows => {
+            const xdg_path = try preferredXdgPath(alloc);
+            errdefer alloc.free(xdg_path);
+            if (open(global.io(), xdg_path)) |f| {
+                f.close(global.io());
+                return xdg_path;
+            } else |_| {}
+
+            for ([_][]const u8{ "config.ghostty", "config" }) |name| {
+                const legacy_path = try windowsLegacyPath(alloc, name) orelse continue;
+                if (open(global.io(), legacy_path)) |f| {
+                    f.close(global.io());
+                    alloc.free(xdg_path);
+                    return legacy_path;
+                } else |_| alloc.free(legacy_path);
+            }
+
+            return xdg_path;
         },
 
         // All other platforms use XDG only

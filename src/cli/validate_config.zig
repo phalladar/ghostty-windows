@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
 const Action = @import("ghostty.zig").Action;
@@ -44,7 +45,10 @@ pub fn run(alloc: std.mem.Allocator) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(global.io(), &buffer);
     const stdout = &stdout_writer.interface;
     const result = runInner(alloc, opts, stdout);
-    try stdout_writer.end();
+    if (comptime builtin.os.tag == .windows)
+        try stdout_writer.interface.flush()
+    else
+        try stdout_writer.end();
     return result;
 }
 

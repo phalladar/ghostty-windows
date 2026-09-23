@@ -22,7 +22,7 @@ pub const Options = struct {
 pub fn config(io: std.Io, alloc: Allocator, environ_map: *const std.process.Environ.Map, opts: Options) ![]u8 {
     return try dir(io, alloc, environ_map, opts, .{
         .env = "XDG_CONFIG_HOME",
-        .windows_env = "LOCALAPPDATA",
+        .windows_env = "APPDATA",
         .default_subdir = ".config",
     });
 }
@@ -68,10 +68,14 @@ fn dir(
         });
     }
 
-    // First check the env var. On Windows we treat `LOCALAPPDATA` as a
-    // fallback for `XDG_CONFIG_HOME`
+    // First check the env var. On Windows we treat `APPDATA` (config) and
+    // `LOCALAPPDATA` (cache, state) as fallbacks for the XDG variables.
     const env = switch (builtin.os.tag) {
-        .windows => environ_map.get(internal_opts.env) orelse environ_map.get(internal_opts.windows_env) orelse "",
+        .windows => env: {
+            const xdg: []const u8 = environ_map.get(internal_opts.env) orelse "";
+            if (xdg.len > 0) break :env xdg;
+            break :env environ_map.get(internal_opts.windows_env) orelse "";
+        },
         else => environ_map.get(internal_opts.env) orelse "",
     };
 
@@ -165,8 +169,6 @@ test "cache directory paths" {
 }
 
 test "fallback when xdg env empty" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -187,6 +189,11 @@ test "fallback when xdg env empty" {
         defer environ_map.deinit();
         const temp_home = "/tmp/ghostty-test-home";
         try environ_map.put("HOME", temp_home);
+        if (builtin.os.tag == .windows) {
+            try environ_map.put("USERPROFILE", temp_home);
+            _ = environ_map.swapRemove("APPDATA");
+            _ = environ_map.swapRemove("LOCALAPPDATA");
+        }
 
         const expected = try std.fs.path.join(alloc, &[_][]const u8{
             temp_home,
@@ -204,8 +211,6 @@ test "fallback when xdg env empty" {
 }
 
 test "fallback when xdg env empty and subdir" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     const io = std.testing.io;
     const alloc = std.testing.allocator;
 
@@ -226,6 +231,11 @@ test "fallback when xdg env empty and subdir" {
         defer environ_map.deinit();
         const temp_home = "/tmp/ghostty-test-home";
         try environ_map.put("HOME", temp_home);
+        if (builtin.os.tag == .windows) {
+            try environ_map.put("USERPROFILE", temp_home);
+            _ = environ_map.swapRemove("APPDATA");
+            _ = environ_map.swapRemove("LOCALAPPDATA");
+        }
 
         const expected = try std.fs.path.join(alloc, &[_][]const u8{
             temp_home,
@@ -240,6 +250,42 @@ test "fallback when xdg env empty and subdir" {
         defer alloc.free(actual);
 
         try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "windows known folder env vars" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const io = testing.io;
+    const alloc = testing.allocator;
+
+    var environ_map = std.process.Environ.Map.init(alloc);
+    defer environ_map.deinit();
+    try environ_map.put("APPDATA", "C:\\Users\\test\\AppData\\Roaming");
+    try environ_map.put("LOCALAPPDATA", "C:\\Users\\test\\AppData\\Local");
+
+    {
+        const actual = try config(io, alloc, &environ_map, .{ .subdir = "ghostty" });
+        defer alloc.free(actual);
+        try testing.expectEqualStrings("C:\\Users\\test\\AppData\\Roaming\\ghostty", actual);
+    }
+    {
+        const actual = try cache(io, alloc, &environ_map, .{ .subdir = "ghostty" });
+        defer alloc.free(actual);
+        try testing.expectEqualStrings("C:\\Users\\test\\AppData\\Local\\ghostty", actual);
+    }
+    {
+        const actual = try state(io, alloc, &environ_map, .{ .subdir = "ghostty" });
+        defer alloc.free(actual);
+        try testing.expectEqualStrings("C:\\Users\\test\\AppData\\Local\\ghostty", actual);
+    }
+
+    try environ_map.put("XDG_CONFIG_HOME", "D:\\xdg");
+    {
+        const actual = try config(io, alloc, &environ_map, .{ .subdir = "ghostty" });
+        defer alloc.free(actual);
+        try testing.expectEqualStrings("D:\\xdg\\ghostty", actual);
     }
 }
 

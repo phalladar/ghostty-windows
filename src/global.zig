@@ -180,6 +180,14 @@ pub fn init(opts: InitOpts) !void {
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
 
+    if (comptime builtin.os.tag == .windows) minidump: {
+        var environ_map = self.environ.createMap(self.alloc) catch break :minidump;
+        defer environ_map.deinit();
+        crash.minidump.install(self.io(), self.alloc, &environ_map) catch |err| {
+            std.log.warn("minidump handler install failed err={}", .{err});
+        };
+    }
+
     if (build_options.sentry) {
         // Initialize our crash reporting. The environ map snapshot is
         // owned by crash.init (it is freed by the init thread).

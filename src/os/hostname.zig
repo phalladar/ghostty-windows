@@ -17,12 +17,9 @@ pub fn isLocal(hostname: []const u8) LocalHostnameValidationError!bool {
     // If hostname is not "localhost" it must match our hostname.
     switch (builtin.os.tag) {
         .windows => {
-            const windows = @import("windows.zig");
-            var buf: [256:0]u8 = undefined;
-            var nSize: windows.DWORD = buf.len;
-            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE) return false;
-            const ourHostname = buf[0..nSize];
-            return std.mem.eql(u8, hostname, ourHostname);
+            var buf: [256]u8 = undefined;
+            const ourHostname = windowsHostname(&buf) orelse return false;
+            return std.ascii.eqlIgnoreCase(hostname, ourHostname);
         },
         else => {
             var buf: [posix.HOST_NAME_MAX]u8 = undefined;
@@ -32,6 +29,19 @@ pub fn isLocal(hostname: []const u8) LocalHostnameValidationError!bool {
     }
 }
 
+fn windowsHostname(buf: []u8) ?[]const u8 {
+    const windows = @import("windows.zig");
+    var wbuf: [64]u16 = undefined;
+    var n: windows.DWORD = wbuf.len;
+    if (windows.exp.kernel32.GetComputerNameExW(
+        .DnsHostname,
+        &wbuf,
+        &n,
+    ) == windows.FALSE) return null;
+    const len = std.unicode.utf16LeToUtf8(buf, wbuf[0..n]) catch return null;
+    return buf[0..len];
+}
+
 test "isLocal returns true when provided hostname is localhost" {
     try std.testing.expect(try isLocal("localhost"));
 }
@@ -39,12 +49,9 @@ test "isLocal returns true when provided hostname is localhost" {
 test "isLocal returns true when hostname is local" {
     switch (builtin.os.tag) {
         .windows => {
-            const windows = @import("windows.zig");
-            var buf: [256:0]u8 = undefined;
-            var nSize: windows.DWORD = buf.len;
-            if (windows.exp.kernel32.GetComputerNameA(&buf, &nSize) == windows.FALSE)
+            var buf: [256]u8 = undefined;
+            const localHostname = windowsHostname(&buf) orelse
                 return error.GetComputerNameFailed;
-            const localHostname = buf[0..nSize];
             try std.testing.expect(try isLocal(localHostname));
         },
         else => {

@@ -67,6 +67,31 @@ sudo xcode-select --switch /Applications/Xcode.app
 > You do not need to be running on macOS 26 to build Ghostty, you can
 > still use Xcode 26 on macOS 15 stable.
 
+### Windows
+
+The Windows GUI is the `win32` application runtime, which is the default
+when building on or for Windows (`-Dapp-runtime=win32` selects it
+explicitly). Building it needs Zig (installable with
+`winget install --id zig.zig --exact --version <version>`, matching
+`minimum_zig_version` in `build.zig.zon`) and, for the default MSVC ABI,
+the Visual Studio Build Tools "Desktop development with C++" workload with
+a Windows 10/11 SDK. Zig finds both without a Developer Command Prompt.
+
+```powershell
+zig build -Dapp-runtime=win32                 # zig-out\bin\ghostty.exe
+zig build run -Dapp-runtime=win32             # build and launch
+zig build test -Dtest-filter=<filter>
+```
+
+Without the MSVC toolset, `-Dtarget=x86_64-windows-gnu` builds against the
+mingw-w64 headers that ship with Zig. Enabling Developer Mode (for
+symlinks in dependency tarballs) and long paths
+(`git config --global core.longpaths true`) avoids common fetch errors.
+[`windows/docs/02-environment.md`](windows/docs/02-environment.md) has the
+full setup and debugging notes, and
+[`dist/windows/README-windows.md`](dist/windows/README-windows.md)
+covers release packaging.
+
 ## AI and Agents
 
 If you're using AI assistance with Ghostty, Ghostty provides an
@@ -105,6 +130,11 @@ On Linux if Ghostty is launched by the default `systemd` user service, you can u
 
 On macOS logging to the macOS unified log is available and enabled by default.
 Use the system `log` CLI to view Ghostty's logs: `sudo log stream --level debug --predicate 'subsystem=="com.mitchellh.ghostty"'`.
+
+On Windows Ghostty is a GUI-subsystem program. Debug builds attach to the
+console they were started from and log there; for other builds, redirect
+`stderr` to a file, e.g. `Start-Process ghostty.exe -RedirectStandardError ghostty.log`
+in PowerShell or `ghostty.exe 2> ghostty.log` in `cmd.exe`.
 
 Ghostty's logging can be configured in two ways. The first is by what
 optimization level Ghostty is compiled with. If Ghostty is compiled with `Debug`

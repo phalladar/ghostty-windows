@@ -333,10 +333,58 @@ const WindowsPty = struct {
 
     out_pipe: windows.HANDLE,
     in_pipe: windows.HANDLE,
-    out_pipe_pty: windows.HANDLE,
-    in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.HPCON,
+    pseudo_console: ?windows.HPCON,
     size: winsize,
+    conpty: Conpty,
+
+    const Conpty = struct {
+        create: *const fn (
+            windows.COORD,
+            windows.HANDLE,
+            windows.HANDLE,
+            windows.DWORD,
+            *windows.HPCON,
+        ) callconv(.winapi) windows.HRESULT,
+        resize: *const fn (windows.HPCON, windows.COORD) callconv(.winapi) windows.HRESULT,
+        close: *const fn (windows.HPCON) callconv(.winapi) void,
+        bundled: bool,
+
+        const system: Conpty = .{
+            .create = &windows.exp.kernel32.CreatePseudoConsole,
+            .resize = &windows.exp.kernel32.ResizePseudoConsole,
+            .close = &windows.exp.kernel32.ClosePseudoConsole,
+            .bundled = false,
+        };
+
+        // The inbox conhost repaints the viewport after every resize and
+        // overwrites our reflow; the conpty.dll + OpenConsole.exe shipped
+        // next to the exe does not.
+        fn load() Conpty {
+            var buf: [windows.MAX_PATH + 16]u16 = undefined;
+            const n = windows.exp.kernel32.GetModuleFileNameW(null, &buf, windows.MAX_PATH);
+            if (n == 0 or n >= windows.MAX_PATH) return system;
+            const dir_len = std.mem.lastIndexOfScalar(u16, buf[0..n], '\\') orelse return system;
+            const name = std.unicode.utf8ToUtf16LeStringLiteral("conpty.dll");
+            @memcpy(buf[dir_len + 1 ..][0..name.len], name);
+            buf[dir_len + 1 + name.len] = 0;
+            const path: [*:0]const u16 = @ptrCast(&buf);
+            const module = windows.exp.kernel32.LoadLibraryExW(
+                path,
+                null,
+                windows.LOAD_WITH_ALTERED_SEARCH_PATH,
+            ) orelse return system;
+            const k = windows.exp.kernel32;
+            const create = k.GetProcAddress(module, "CreatePseudoConsole") orelse return system;
+            const resize = k.GetProcAddress(module, "ResizePseudoConsole") orelse return system;
+            const close = k.GetProcAddress(module, "ClosePseudoConsole") orelse return system;
+            return .{
+                .create = @ptrCast(create),
+                .resize = @ptrCast(resize),
+                .close = @ptrCast(close),
+                .bundled = true,
+            };
+        }
+    };
 
     pub const OpenError = error{Unexpected};
 
@@ -386,7 +434,7 @@ const WindowsPty = struct {
         errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe);
 
         var security_attributes_read = security_attributes;
-        pty.in_pipe_pty = windows.exp.kernel32.CreateFileW(
+        const in_pipe_pty = windows.exp.kernel32.CreateFileW(
             pipe_path_w.ptr,
             windows.GENERIC_READ,
             0,
@@ -395,10 +443,10 @@ const WindowsPty = struct {
             windows.FILE_ATTRIBUTE_NORMAL,
             null,
         );
-        if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
+        if (in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
             return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe_pty);
+        defer _ = windows.exp.kernel32.CloseHandle(in_pipe_pty);
 
         // The in_pipe needs to be created as a named pipe, since anonymous
         // pipes created with CreatePipe do not support overlapped operations,
@@ -415,13 +463,12 @@ const WindowsPty = struct {
         //     _ = windows.CloseHandle(pty.in_pipe);
         // }
 
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == windows.FALSE) {
+        var out_pipe_pty: windows.HANDLE = undefined;
+        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &out_pipe_pty, null, 0) == windows.FALSE) {
             return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer {
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
-            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
-        }
+        defer _ = windows.exp.kernel32.CloseHandle(out_pipe_pty);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
 
         const SetHandleInformation = struct {
             fn f(hObject: windows.HANDLE) !void {
@@ -436,30 +483,40 @@ const WindowsPty = struct {
         };
 
         try SetHandleInformation.f(pty.in_pipe);
-        try SetHandleInformation.f(pty.in_pipe_pty);
+        try SetHandleInformation.f(in_pipe_pty);
         try SetHandleInformation.f(pty.out_pipe);
-        try SetHandleInformation.f(pty.out_pipe_pty);
+        try SetHandleInformation.f(out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        pty.conpty = Conpty.load();
+        log.debug("pseudo console bundled={}", .{pty.conpty.bundled});
+        var pseudo_console: windows.HPCON = undefined;
+        const result = pty.conpty.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-            pty.in_pipe_pty,
-            pty.out_pipe_pty,
-            0,
-            &pty.pseudo_console,
+            in_pipe_pty,
+            out_pipe_pty,
+            windows.PSEUDOCONSOLE_INHERIT_CURSOR,
+            &pseudo_console,
         );
         if (result != windows.S_OK) return error.Unexpected;
+        pty.pseudo_console = pseudo_console;
 
         pty.size = size;
         return pty;
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        self.closePseudoConsole();
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
         self.* = undefined;
+    }
+
+    // ClosePseudoConsole can block until out_pipe is drained, so call it
+    // while a reader is still active and never from the reader thread.
+    pub fn closePseudoConsole(self: *Pty) void {
+        const hpc = self.pseudo_console orelse return;
+        self.pseudo_console = null;
+        self.conpty.close(hpc);
     }
 
     pub const GetSizeError = error{};
@@ -473,8 +530,13 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
-            self.pseudo_console,
+        const hpc = self.pseudo_console orelse return;
+        if (size.ws_row == self.size.ws_row and size.ws_col == self.size.ws_col) {
+            self.size = size;
+            return;
+        }
+        const result = self.conpty.resize(
+            hpc,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );
 

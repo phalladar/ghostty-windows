@@ -36,6 +36,8 @@ const File = std.Io.File;
 const EnvMap = std.process.Environ.Map;
 const apprt = @import("apprt.zig");
 
+const log = std.log.scoped(.command);
+
 /// Function prototype for a function executed /in the child process/ after the
 /// fork, but before exec'ing the command. If the function returns a u8, the
 /// child process will be exited with that error code.
@@ -102,6 +104,9 @@ rt_post_fork_info: RtPostForkInfo,
 /// If set, then the process will be created attached to this pseudo console.
 /// `stdin`, `stdout`, and `stderr` will be ignored if set.
 pseudo_console: if (builtin.os.tag == .windows) ?windows.HPCON else void =
+    if (builtin.os.tag == .windows) null else {},
+
+job: if (builtin.os.tag == .windows) ?windows.HANDLE else void =
     if (builtin.os.tag == .windows) null else {},
 
 /// User data that is sent to the callback. Set with setData and getData
@@ -415,8 +420,14 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         .lpAttributeList = attribute_list,
     };
 
+    const job: ?windows.HANDLE = if (self.pseudo_console != null) createWindowsJob() else null;
+    errdefer if (job) |j| {
+        _ = windows.exp.kernel32.CloseHandle(j);
+    };
+
     var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT;
     if (attribute_list != null) flags |= windows.EXTENDED_STARTUPINFO_PRESENT;
+    if (job != null) flags |= windows.CREATE_SUSPENDED;
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
     if (windows.exp.kernel32.CreateProcessW(
@@ -424,7 +435,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         command_line_w.ptr,
         null,
         null,
-        windows.TRUE,
+        if (attribute_list != null) windows.FALSE else windows.TRUE,
         flags,
         if (env_w) |w| w.ptr else null,
         if (cwd_w) |w| w.ptr else null,
@@ -432,7 +443,88 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+    if (job) |j| {
+        // The process must be in the job before its first instruction
+        // runs, otherwise it can spawn children outside the job.
+        if (windows.exp.kernel32.AssignProcessToJobObject(j, process_information.hProcess) == windows.FALSE) {
+            log.warn("AssignProcessToJobObject failed err={}", .{windows.GetLastError()});
+            _ = windows.exp.kernel32.CloseHandle(j);
+        } else {
+            self.job = j;
+        }
+        _ = windows.exp.kernel32.ResumeThread(process_information.hThread);
+    }
+
+    _ = windows.exp.kernel32.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
+}
+
+fn createWindowsJob() ?windows.HANDLE {
+    const job = windows.exp.kernel32.CreateJobObjectW(null, null) orelse {
+        log.warn("CreateJobObjectW failed err={}", .{windows.GetLastError()});
+        return null;
+    };
+    var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = .{};
+    info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    if (windows.exp.kernel32.SetInformationJobObject(
+        job,
+        .ExtendedLimitInformation,
+        &info,
+        @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == windows.FALSE) {
+        log.warn("SetInformationJobObject failed err={}", .{windows.GetLastError()});
+        _ = windows.exp.kernel32.CloseHandle(job);
+        return null;
+    }
+    return job;
+}
+
+pub fn windowsForegroundPid(self: *const Command) ?u64 {
+    const job = self.job orelse return null;
+
+    const IdList = extern struct {
+        assigned: windows.DWORD,
+        count: windows.DWORD,
+        ids: [256]windows.ULONG_PTR,
+    };
+    var list: IdList = undefined;
+    if (windows.exp.kernel32.QueryInformationJobObject(
+        job,
+        .BasicProcessIdList,
+        &list,
+        @sizeOf(IdList),
+        null,
+    ) == windows.FALSE and windows.GetLastError() != .MORE_DATA) return null;
+
+    var best: ?u64 = null;
+    var best_time: u64 = 0;
+    for (list.ids[0..@min(list.count, list.ids.len)]) |id| {
+        const handle = windows.exp.kernel32.OpenProcess(
+            windows.PROCESS_QUERY_LIMITED_INFORMATION,
+            windows.FALSE,
+            @intCast(id),
+        ) orelse continue;
+        defer _ = windows.exp.kernel32.CloseHandle(handle);
+
+        var creation: windows.FILETIME = undefined;
+        var exit: windows.FILETIME = undefined;
+        var kernel: windows.FILETIME = undefined;
+        var user: windows.FILETIME = undefined;
+        if (windows.exp.kernel32.GetProcessTimes(
+            handle,
+            &creation,
+            &exit,
+            &kernel,
+            &user,
+        ) == windows.FALSE) continue;
+
+        const time = (@as(u64, creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+        if (best == null or time >= best_time) {
+            best = id;
+            best_time = time;
+        }
+    }
+    return best;
 }
 
 fn setupFd(src: File.Handle, target: i32) !void {
@@ -479,6 +571,15 @@ fn setupFd(src: File.Handle, target: i32) !void {
             _ = try PosixCall.f(posix.system.dup2, .{ src, target });
         },
         else => @compileError("unsupported platform"),
+    }
+}
+
+pub fn deinit(self: *Command) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (self.job) |job| _ = windows.exp.kernel32.CloseHandle(job);
+        self.job = null;
+        if (self.pid) |pid| _ = windows.exp.kernel32.CloseHandle(pid);
+        self.pid = null;
     }
 }
 
@@ -576,6 +677,16 @@ fn createNullDelimitedEnvMap(arena: mem.Allocator, env_map: *const EnvMap) ![:nu
     return envp_buf;
 }
 
+fn windowsEnvKeyLessThan(_: void, a: []const u8, b: []const u8) bool {
+    const len = @min(a.len, b.len);
+    for (a[0..len], b[0..len]) |ca, cb| {
+        const ua = std.ascii.toUpper(ca);
+        const ub = std.ascii.toUpper(cb);
+        if (ua != ub) return ua < ub;
+    }
+    return a.len < b.len;
+}
+
 // Copied from Zig. This is a publicly exported function but there is no
 // way to get it from the std package.
 fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u16 {
@@ -593,13 +704,21 @@ fn createWindowsEnvBlock(allocator: mem.Allocator, env_map: *const EnvMap) ![]u1
     const result = try allocator.alloc(u16, max_chars_needed);
     errdefer allocator.free(result);
 
-    var it = env_map.iterator();
+    const keys = try allocator.alloc([]const u8, env_map.count());
+    defer allocator.free(keys);
+    {
+        var it = env_map.iterator();
+        var k: usize = 0;
+        while (it.next()) |pair| : (k += 1) keys[k] = pair.key_ptr.*;
+    }
+    std.mem.sort([]const u8, keys, {}, windowsEnvKeyLessThan);
+
     var i: usize = 0;
-    while (it.next()) |pair| {
-        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.key_ptr.*);
+    for (keys) |key| {
+        i += try std.unicode.utf8ToUtf16Le(result[i..], key);
         result[i] = '=';
         i += 1;
-        i += try std.unicode.utf8ToUtf16Le(result[i..], pair.value_ptr.*);
+        i += try std.unicode.utf8ToUtf16Le(result[i..], env_map.get(key).?);
         result[i] = 0;
         i += 1;
     }
@@ -680,6 +799,24 @@ test "createNullDelimitedEnvMap" {
             try testing.expect(false); // Environment variable not found
         }
     }
+}
+
+test "createWindowsEnvBlock windows: sorted case-insensitively by name" {
+    const allocator = testing.allocator;
+    var envmap = EnvMap.init(allocator);
+    defer envmap.deinit();
+
+    try envmap.put("b", "2");
+    try envmap.put("_x", "4");
+    try envmap.put("A", "1");
+    try envmap.put("C", "3");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const block = try createWindowsEnvBlock(arena.allocator(), &envmap);
+
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("A=1\x00b=2\x00C=3\x00_x=4\x00\x00");
+    try testing.expectEqualSlices(u16, expected, block[0..expected.len]);
 }
 
 test "Command: os pre exec 1" {

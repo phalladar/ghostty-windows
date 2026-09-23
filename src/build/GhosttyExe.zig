@@ -43,8 +43,23 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     switch (cfg.target.result.os.tag) {
         .windows => {
             exe.subsystem = .Windows;
+            if (cfg.target.result.abi == .msvc) {
+                exe.entry = .{ .symbol_name = "mainCRTStartup" };
+            }
+            const v = cfg.version;
+            var rc_flags: std.ArrayList([]const u8) = .empty;
+            try rc_flags.appendSlice(b.allocator, &.{
+                "/d", b.fmt("VERSION_MAJOR={d}", .{v.major}),
+                "/d", b.fmt("VERSION_MINOR={d}", .{v.minor}),
+                "/d", b.fmt("VERSION_PATCH={d}", .{v.patch}),
+                "/d", b.fmt("VERSION_STRING=\"{f}\"", .{v}),
+            });
+            if (cfg.optimize == .Debug) {
+                try rc_flags.appendSlice(b.allocator, &.{ "/d", "GHOSTTY_DEBUG" });
+            }
             exe.root_module.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
+                .flags = rc_flags.items,
             });
         },
 

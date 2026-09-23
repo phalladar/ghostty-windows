@@ -14,6 +14,7 @@ const apprt = @import("apprt.zig");
 const App = @import("App.zig");
 const Ghostty = @import("main_c.zig").Ghostty;
 const global = @import("global.zig");
+const internal_os = @import("os/main.zig");
 
 /// The return type for main() depends on the build artifact. The lib build
 /// also calls "main" in order to run the CLI actions, but it calls it as
@@ -24,6 +25,8 @@ const MainReturn = switch (build_config.artifact) {
 };
 
 pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
+    if (comptime builtin.os.tag == .windows) attachConsole(minimal.args);
+
     // We first start by initializing our global state. This will setup
     // process-level state we need to run the terminal. The reason we use
     // a global is because the C API needs to be able to access this state;
@@ -114,6 +117,16 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
     try app_runtime.run();
 }
 
+fn attachConsole(args: std.process.Args) void {
+    const want = builtin.mode == .Debug or
+        if (cli.action.detectArgs(
+            cli.ghostty.Action,
+            std.heap.page_allocator,
+            args,
+        )) |action| action != null else |_| true;
+    if (want) _ = internal_os.windows.attachParentConsole();
+}
+
 // The function std.log will call.
 fn logFn(
     comptime level: std.log.Level,
@@ -197,6 +210,11 @@ fn macosLogger(comptime scope: @TypeOf(.EnumLiteral)) *macos.os.Log {
 
     return created;
 }
+
+pub const panic = std.debug.FullPanic(switch (builtin.os.tag) {
+    .windows => @import("crash/main.zig").minidump.panic,
+    else => std.debug.defaultPanic,
+});
 
 pub const std_options: std.Options = .{
     // Our log level is always at least info in every build mode.

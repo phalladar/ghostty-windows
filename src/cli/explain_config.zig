@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const args = @import("args.zig");
 const Allocator = std.mem.Allocator;
 const Action = @import("ghostty.zig").Action;
@@ -82,7 +83,10 @@ pub fn run(alloc: Allocator) !u8 {
         try stderr_writer.interface.writeAll("Usage: ghostty +explain-config <option>\n");
         try stderr_writer.interface.writeAll("       ghostty +explain-config --option=<option>\n");
         try stderr_writer.interface.writeAll("       ghostty +explain-config --keybind=<action>\n");
-        try stderr_writer.end();
+        if (comptime builtin.os.tag == .windows)
+            try stderr_writer.interface.flush()
+        else
+            try stderr_writer.end();
         return 1;
     };
 

@@ -13,9 +13,11 @@ const log = std.log.scoped(.shell_integration);
 /// Shell types we support
 pub const Shell = enum {
     bash,
+    cmd,
     elvish,
     fish,
     nushell,
+    pwsh,
     zsh,
 };
 
@@ -72,6 +74,10 @@ pub fn setup(
             resource_dir,
             env,
         ),
+
+        .pwsh => try setupPwsh(alloc_arena, command, resource_dir),
+
+        .cmd => try setupCmd(alloc_arena, command, env),
 
         .elvish, .fish => xdg: {
             if (!try setupXdgDataDirs(alloc_arena, resource_dir, env)) return null;
@@ -139,7 +145,17 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     defer arg_iter.deinit();
 
     const arg0 = arg_iter.next() orelse return null;
-    const exe = std.fs.path.basename(arg0);
+    var exe_buf: [16]u8 = undefined;
+    const exe = exe: {
+        const base = std.fs.path.basename(arg0);
+        if (comptime builtin.os.tag != .windows) break :exe base;
+        const stem = if (std.ascii.endsWithIgnoreCase(base, ".exe"))
+            base[0 .. base.len - ".exe".len]
+        else
+            base;
+        if (stem.len > exe_buf.len) return null;
+        break :exe std.ascii.lowerString(&exe_buf, stem);
+    };
 
     if (std.mem.eql(u8, "bash", exe)) {
         // Apple distributes their own patched version of Bash 3.2
@@ -163,6 +179,12 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "nu", exe)) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
 
+    if (comptime builtin.os.tag == .windows) {
+        if (std.mem.eql(u8, "pwsh", exe)) return .pwsh;
+        if (std.mem.eql(u8, "powershell", exe)) return .pwsh;
+        if (std.mem.eql(u8, "cmd", exe)) return .cmd;
+    }
+
     return null;
 }
 
@@ -183,6 +205,25 @@ test detectShell {
 
     try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "bash -c 'command'" }));
     try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "\"/a b/bash\"" }));
+
+    if (comptime builtin.os.tag == .windows) {
+        try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "bash.exe" }));
+        try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "\"C:/Program Files/Git/bin/bash.exe\" --login" }));
+        try testing.expectEqual(.nushell, try detectShell(alloc, .{ .direct = &.{"C:\\tools\\Nu.EXE"} }));
+        try testing.expectEqual(.fish, try detectShell(alloc, .{ .direct = &.{ "C:\\msys64\\usr\\bin\\fish.exe", "-l" } }));
+        try testing.expectEqual(.zsh, try detectShell(alloc, .{ .shell = "ZSH" }));
+        try testing.expectEqual(.pwsh, try detectShell(alloc, .{ .shell = "pwsh.exe" }));
+        try testing.expectEqual(.pwsh, try detectShell(alloc, .{ .shell = "pwsh" }));
+        try testing.expectEqual(.pwsh, try detectShell(alloc, .{ .shell = "PowerShell.EXE -NoProfile" }));
+        try testing.expectEqual(.pwsh, try detectShell(alloc, .{ .shell = "powershell" }));
+        try testing.expectEqual(.pwsh, try detectShell(alloc, .{ .direct = &.{"C:\\Program Files\\PowerShell\\7\\pwsh.exe"} }));
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "cmd.exe" }));
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "C:\\Windows\\System32\\CMD.EXE /k" }));
+        try testing.expect(try detectShell(alloc, .{ .shell = "pwsh-preview.exe" }) == null);
+    } else {
+        try testing.expect(try detectShell(alloc, .{ .shell = "pwsh" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "cmd" }) == null);
+    }
 }
 
 /// Set up the shell integration features environment variable.
@@ -1007,6 +1048,270 @@ test "zsh: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
+fn setupPwsh(
+    alloc: Allocator,
+    command: config.Command,
+    resource_dir: []const u8,
+) !?config.Command {
+    var args: std.ArrayList([:0]const u8) = .empty;
+
+    var iter = try command.argIterator(alloc);
+    defer iter.deinit();
+
+    const exe = iter.next() orelse return null;
+    try args.append(alloc, try alloc.dupeZ(u8, exe));
+
+    while (iter.next()) |arg| {
+        try args.append(alloc, try alloc.dupeZ(u8, arg));
+        switch (classifyPwshArg(arg)) {
+            .unsupported => return null,
+            .flag => {},
+            .value => if (iter.next()) |value| {
+                try args.append(alloc, try alloc.dupeZ(u8, value));
+            },
+        }
+    }
+
+    const sep = std.fs.path.sep_str;
+    const script_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}" ++ sep ++ "shell-integration" ++ sep ++ "powershell" ++ sep ++ "ghostty.ps1",
+        .{resource_dir},
+    );
+    if (std.Io.Dir.openFileAbsolute(global.io(), script_path, .{})) |file| {
+        file.close(global.io());
+    } else |err| {
+        log.warn("unable to open {s}: {}", .{ script_path, err });
+        return null;
+    }
+
+    var script: std.Io.Writer.Allocating = .init(alloc);
+    try script.writer.writeAll(". '");
+    for (script_path) |c| {
+        if (c == '\'') try script.writer.writeByte('\'');
+        try script.writer.writeByte(c);
+    }
+    try script.writer.writeByte('\'');
+
+    try args.append(alloc, "-NoExit");
+    try args.append(alloc, "-Command");
+    try args.append(alloc, try script.toOwnedSliceSentinel(0));
+
+    return .{ .direct = try args.toOwnedSlice(alloc) };
+}
+
+const PwshArg = enum { flag, value, unsupported };
+
+const PwshParam = struct { []const u8, usize };
+
+fn classifyPwshArg(arg: []const u8) PwshArg {
+    const name_full = if (std.mem.startsWith(u8, arg, "--"))
+        arg[2..]
+    else if (std.mem.startsWith(u8, arg, "-"))
+        arg[1..]
+    else
+        return .unsupported;
+
+    const name_end = std.mem.indexOfScalar(u8, name_full, ':') orelse name_full.len;
+    const name = name_full[0..name_end];
+    if (name.len == 0) return .unsupported;
+
+    const exact_unsupported = [_][]const u8{ "e", "ec", "cwa", "?" };
+    for (exact_unsupported) |v| {
+        if (std.ascii.eqlIgnoreCase(name, v)) return .unsupported;
+    }
+    const unsupported = [_]PwshParam{
+        .{ "command", 1 },
+        .{ "commandwithargs", 8 },
+        .{ "file", 1 },
+        .{ "encodedcommand", 2 },
+        .{ "noexit", 3 },
+        .{ "help", 1 },
+        .{ "version", 1 },
+    };
+    for (unsupported) |p| {
+        if (matchesPwshParam(name, p)) return .unsupported;
+    }
+
+    if (name_end < name_full.len) return .flag;
+
+    const exact_value = [_][]const u8{ "ep", "wd", "w", "of", "if" };
+    for (exact_value) |v| {
+        if (std.ascii.eqlIgnoreCase(name, v)) return .value;
+    }
+    const value = [_]PwshParam{
+        .{ "executionpolicy", 2 },
+        .{ "workingdirectory", 2 },
+        .{ "windowstyle", 2 },
+        .{ "outputformat", 1 },
+        .{ "inputformat", 3 },
+        .{ "configurationname", 4 },
+        .{ "configurationfile", 4 },
+        .{ "custompipename", 2 },
+        .{ "settingsfile", 2 },
+        .{ "psconsolefile", 2 },
+    };
+    for (value) |p| {
+        if (matchesPwshParam(name, p)) return .value;
+    }
+
+    return .flag;
+}
+
+fn matchesPwshParam(name: []const u8, param: PwshParam) bool {
+    return name.len >= param[1] and
+        name.len <= param[0].len and
+        std.ascii.startsWithIgnoreCase(param[0], name);
+}
+
+test "pwsh" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.pwsh);
+    defer res.deinit();
+
+    const sep = std.fs.path.sep_str;
+    const script = try std.fmt.allocPrint(
+        alloc,
+        ". '{s}" ++ sep ++ "shell-integration" ++ sep ++ "powershell" ++ sep ++ "ghostty.ps1'",
+        .{res.path},
+    );
+
+    {
+        const command = (try setupPwsh(alloc, .{ .shell = "pwsh" }, res.path)).?;
+        try testing.expectEqual(4, command.direct.len);
+        try testing.expectEqualStrings("pwsh", command.direct[0]);
+        try testing.expectEqualStrings("-NoExit", command.direct[1]);
+        try testing.expectEqualStrings("-Command", command.direct[2]);
+        try testing.expectEqualStrings(script, command.direct[3]);
+    }
+
+    {
+        const command = (try setupPwsh(alloc, .{ .shell = "pwsh -NoLogo" }, res.path)).?;
+        try testing.expectEqual(5, command.direct.len);
+        try testing.expectEqualStrings("-NoLogo", command.direct[1]);
+        try testing.expectEqualStrings("-NoExit", command.direct[2]);
+    }
+
+    {
+        const command = (try setupPwsh(alloc, .{ .shell = "powershell.exe -NoProfile" }, res.path)).?;
+        try testing.expectEqualStrings("powershell.exe", command.direct[0]);
+        try testing.expectEqualStrings("-NoProfile", command.direct[1]);
+        try testing.expectEqualStrings(script, command.direct[4]);
+    }
+
+    {
+        const command = (try setupPwsh(alloc, .{ .direct = &.{ "pwsh", "-WorkingDirectory", "a b", "-ExecutionPolicy:Bypass", "-l" } }, res.path)).?;
+        try testing.expectEqual(8, command.direct.len);
+        try testing.expectEqualStrings("a b", command.direct[2]);
+        try testing.expectEqualStrings("-ExecutionPolicy:Bypass", command.direct[3]);
+        try testing.expectEqualStrings("-l", command.direct[4]);
+        try testing.expectEqualStrings("-NoExit", command.direct[5]);
+    }
+}
+
+test "pwsh: unsupported options" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.pwsh);
+    defer res.deinit();
+
+    const cmdlines = [_][:0]const u8{
+        "pwsh -Command x",
+        "pwsh -c x",
+        "pwsh -Com x",
+        "pwsh -NoLogo -command:x",
+        "pwsh -File x.ps1",
+        "pwsh -f x.ps1",
+        "pwsh -Fi x.ps1",
+        "pwsh -EncodedCommand AAAA",
+        "pwsh -e AAAA",
+        "pwsh -ec AAAA",
+        "pwsh -NoExit",
+        "pwsh -noe",
+        "pwsh -CommandWithArgs x",
+        "pwsh -cwa x",
+        "pwsh -Version",
+        "pwsh -?",
+        "pwsh -",
+        "pwsh script.ps1",
+        "pwsh --command x",
+    };
+
+    for (cmdlines) |cmdline| {
+        try testing.expect(try setupPwsh(alloc, .{ .shell = cmdline }, res.path) == null);
+    }
+
+    try testing.expect(try setupPwsh(alloc, .{ .shell = "pwsh -ExecutionPolicy Bypass" }, res.path) != null);
+    try testing.expect(try setupPwsh(alloc, .{ .shell = "pwsh -NonInteractive" }, res.path) != null);
+}
+
+test "pwsh: missing resources" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const resources_dir = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(resources_dir);
+
+    try testing.expect(try setupPwsh(alloc, .{ .shell = "pwsh" }, resources_dir) == null);
+}
+
+fn setupCmd(
+    alloc: Allocator,
+    command: config.Command,
+    env: *EnvMap,
+) !?config.Command {
+    const prompt = env.get("PROMPT") orelse "$P$G";
+    if (std.mem.indexOf(u8, prompt, "]133;") == null) {
+        try env.put("PROMPT", try std.fmt.allocPrint(
+            alloc,
+            "$E]133;D$E\\$E]133;A$E\\{s}$E]133;B$E\\",
+            .{prompt},
+        ));
+    }
+    return try command.clone(alloc);
+}
+
+test "cmd" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        const command = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+        try testing.expectEqualStrings("cmd.exe", command.?.shell);
+        try testing.expectEqualStrings(
+            "$E]133;D$E\\$E]133;A$E\\$P$G$E]133;B$E\\",
+            env.get("PROMPT").?,
+        );
+    }
+
+    {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        try env.put("PROMPT", "$T $P$G");
+        _ = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+        const expected = "$E]133;D$E\\$E]133;A$E\\$T $P$G$E]133;B$E\\";
+        try testing.expectEqualStrings(expected, env.get("PROMPT").?);
+        _ = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+        try testing.expectEqualStrings(expected, env.get("PROMPT").?);
+    }
+}
+
 /// Test helper that creates a temporary resources directory with shell integration paths.
 const TmpResourcesDir = struct {
     tmp_dir: std.testing.TmpDir,
@@ -1021,7 +1326,10 @@ const TmpResourcesDir = struct {
         const relative_shell_path = try std.fmt.bufPrint(
             &path_buf,
             "shell-integration/{s}",
-            .{@tagName(shell)},
+            .{switch (shell) {
+                .pwsh => "powershell",
+                else => @tagName(shell),
+            }},
         );
         try tmp_dir.dir.createDirPath(std.testing.io, relative_shell_path);
 
@@ -1038,6 +1346,10 @@ const TmpResourcesDir = struct {
         switch (shell) {
             .bash => try tmp_dir.dir.writeFile(std.testing.io, .{
                 .sub_path = "shell-integration/bash/ghostty.bash",
+                .data = "",
+            }),
+            .pwsh => try tmp_dir.dir.writeFile(std.testing.io, .{
+                .sub_path = "shell-integration/powershell/ghostty.ps1",
                 .data = "",
             }),
             else => {},

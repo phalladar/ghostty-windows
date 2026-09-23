@@ -26,23 +26,14 @@ pub fn ensureLocale() !void {
         }
     }
 
-    // Set the locale to whatever is set in env vars.
-    if (setlocale(LC_ALL, "")) |v| {
-        log.info("setlocale from env result={s}", .{v});
+    if (comptime builtin.os.tag == .windows) {
+        ensureLocaleWindows();
         return;
     }
 
-    if (builtin.os.tag == .windows) {
-        // Exit early for Windows.
-        //
-        // NOTE: There currently is no official Windows version of Ghostty,
-        // either by way of an official Windows port or through use of
-        // libghostty-internal. As such this function is likely unused on those
-        // platforms, so this serves as a TODO stub to support more robust
-        // locale support on Windows. setlocale on Windows sets an
-        // "implementation-defined native environment" with an empty string, so
-        // we are currently just doing best-effort for now.
-        log.info("TODO: setlocale failed on Windows, implement better fallbacks", .{});
+    // Set the locale to whatever is set in env vars.
+    if (setlocale(LC_ALL, "")) |v| {
+        log.info("setlocale from env result={s}", .{v});
         return;
     }
 
@@ -74,6 +65,70 @@ pub fn ensureLocale() !void {
         log.info("setlocale default result={s}", .{v});
         return;
     } else log.warn("setlocale failed even with the fallback, uncertain results", .{});
+}
+
+fn ensureLocaleWindows() void {
+    const windows = internal_os.windows;
+
+    if (setlocale(LC_ALL, ".UTF-8")) |v| {
+        log.info("setlocale result={s}", .{v});
+    } else log.warn("setlocale .UTF-8 failed, uncertain results", .{});
+
+    const lang_key = std.unicode.utf8ToUtf16LeStringLiteral("LANG");
+    if (windows.exp.kernel32.GetEnvironmentVariableW(lang_key, null, 0) > 1) return;
+
+    var name_w: [windows.LOCALE_NAME_MAX_LENGTH]u16 = undefined;
+    const name_len = windows.exp.kernel32.GetUserDefaultLocaleName(&name_w, name_w.len);
+    if (name_len <= 1) return;
+
+    var name_buf: [windows.LOCALE_NAME_MAX_LENGTH * 3]u8 = undefined;
+    const name_utf8_len = std.unicode.utf16LeToUtf8(
+        &name_buf,
+        name_w[0..@intCast(name_len - 1)],
+    ) catch return;
+
+    var lang_buf: [64]u8 = undefined;
+    const lang = langFromLocaleName(&lang_buf, name_buf[0..name_utf8_len]) orelse return;
+
+    var lang_w: [64:0]u16 = undefined;
+    const lang_w_len = std.unicode.utf8ToUtf16Le(&lang_w, lang) catch return;
+    lang_w[lang_w_len] = 0;
+    if (windows.exp.kernel32.SetEnvironmentVariableW(
+        lang_key,
+        lang_w[0..lang_w_len :0],
+    ) == windows.FALSE) {
+        log.warn("failed to set LANG from user locale", .{});
+        return;
+    }
+
+    log.info("LANG set from user locale value={s}", .{lang});
+}
+
+fn langFromLocaleName(buf: []u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeScalar(u8, name, '-');
+    const language = it.next() orelse return null;
+    const region: ?[]const u8 = region: {
+        var last: ?[]const u8 = null;
+        while (it.next()) |part| last = part;
+        const r = last orelse break :region null;
+        break :region if (r.len == 2) r else null;
+    };
+
+    var writer: std.Io.Writer = .fixed(buf);
+    writer.writeAll(language) catch return null;
+    if (region) |r| writer.print("_{s}", .{r}) catch return null;
+    writer.writeAll(".UTF-8") catch return null;
+    return writer.buffered();
+}
+
+test langFromLocaleName {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("en_US.UTF-8", langFromLocaleName(&buf, "en-US").?);
+    try testing.expectEqualStrings("sr_RS.UTF-8", langFromLocaleName(&buf, "sr-Latn-RS").?);
+    try testing.expectEqualStrings("de.UTF-8", langFromLocaleName(&buf, "de").?);
+    try testing.expectEqualStrings("es.UTF-8", langFromLocaleName(&buf, "es-419").?);
+    try testing.expect(langFromLocaleName(&buf, "") == null);
 }
 
 /// This sets the LANG environment variable based on the macOS system

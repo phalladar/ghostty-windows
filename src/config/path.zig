@@ -158,12 +158,9 @@ pub const Path = union(enum) {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
 
         // Check if the path starts with a tilde and expand it to the
-        // home directory on Linux/macOS. We explicitly look for "~/"
+        // home directory. We explicitly look for "~/" (or "~\" on Windows)
         // because we don't support alternate users such as "~alice/"
-        if (std.mem.startsWith(u8, path, "~/")) expand: {
-            // Windows isn't supported yet
-            if (comptime builtin.os.tag == .windows) break :expand;
-
+        if (internal_os.hasHomePrefix(path)) {
             var environ_map = try global.environMap();
             defer environ_map.deinit();
 

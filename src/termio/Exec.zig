@@ -123,8 +123,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closeFd(pipe[0]);
+    errdefer closeFd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -200,10 +200,25 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     if (exec.exited) self.subprocess.externalExit();
     self.subprocess.stop();
 
+    if (comptime builtin.os.tag == .windows) {
+        // Must happen while the read thread is still draining out_pipe:
+        // ClosePseudoConsole can block until conhost flushes its final
+        // output, and the read end then reports ERROR_BROKEN_PIPE.
+        if (self.subprocess.pty) |*pty| pty.closePseudoConsole();
+    }
+
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+    if (comptime builtin.os.tag == .windows) {
+        var written: windows.DWORD = 0;
+        if (windows.exp.kernel32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                .BROKEN_PIPE, .NO_DATA => {},
+                else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+            }
+        }
+    } else switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
         // EPIPE means that our read thread is closed already, which is
@@ -299,9 +314,19 @@ fn processExit(
     _: *xev.Completion,
     r: xev.Process.WaitError!u32,
 ) xev.CallbackAction {
-    const exit_code = r catch unreachable;
+    const exit_code = r catch |err| code: {
+        log.err("error waiting for child process exit err={}", .{err});
+        break :code 1;
+    };
     processExitCommon(td_.?, exit_code);
     return .disarm;
+}
+
+fn closeFd(fd: Pty.Fd) void {
+    switch (comptime builtin.os.tag) {
+        .windows => _ = windows.exp.kernel32.CloseHandle(fd),
+        else => _ = posix.system.close(fd),
+    }
 }
 
 fn flatpakExit(
@@ -534,8 +559,8 @@ pub const ThreadData = struct {
 
     /// Reader thread state
     read_thread: std.Thread,
-    read_thread_pipe: posix.fd_t,
-    read_thread_fd: posix.fd_t,
+    read_thread_pipe: Pty.Fd,
+    read_thread_fd: Pty.Fd,
 
     /// The timer to detect termios state changes.
     termios_timer: xev.Timer,
@@ -547,7 +572,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closeFd(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -581,7 +606,7 @@ pub const Config = struct {
 };
 
 const Subprocess = struct {
-    const c = @import("posix_c");
+    const c = if (builtin.os.tag != .windows) @import("posix_c") else struct {};
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
@@ -640,7 +665,14 @@ const Subprocess = struct {
         //
         // For now, we just look up a bundled dir but in the future we should
         // also load the terminfo database and look for it.
-        if (cfg.resources_dir) |base| {
+        if (comptime builtin.os.tag == .windows) {
+            const term = if (std.mem.eql(u8, cfg.term, "xterm-ghostty"))
+                "xterm-256color"
+            else
+                cfg.term;
+            try env.put("TERM", term);
+            try env.put("COLORTERM", "truecolor");
+        } else if (cfg.resources_dir) |base| {
             try env.put("TERM", cfg.term);
             try env.put("COLORTERM", "truecolor");
 
@@ -785,6 +817,7 @@ const Subprocess = struct {
                 .elvish => .elvish,
                 .fish => .fish,
                 .nushell => .nushell,
+                .pwsh => .pwsh,
                 .zsh => .zsh,
             };
 
@@ -1100,6 +1133,12 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |*p| switch (p.*) {
+                .fork_exec => |*cmd| cmd.deinit(),
+                .flatpak => {},
+            };
+        }
         self.process = null;
     }
 
@@ -1110,10 +1149,17 @@ const Subprocess = struct {
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
+                if (comptime builtin.os.tag == .windows) {
+                    // Delivers CTRL_CLOSE_EVENT to the console clients so
+                    // they can exit cleanly before killCommand ends the job.
+                    if (self.pty) |*pty| pty.closePseudoConsole();
+                }
+
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
                 killCommand(cmd) catch |err|
                     log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                if (comptime builtin.os.tag == .windows) cmd.deinit();
             },
 
             .flatpak => |*cmd| if (comptime build_config.flatpak) {
@@ -1157,8 +1203,16 @@ const Subprocess = struct {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
-                    if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
-                        return windows.unexpectedError(windows.GetLastError());
+                    switch (windows.exp.kernel32.WaitForSingleObject(pid, 1000)) {
+                        windows.WAIT_TIMEOUT => if (command.job) |job| {
+                            if (windows.exp.kernel32.TerminateJobObject(job, 0) == windows.FALSE) {
+                                return windows.unexpectedError(windows.GetLastError());
+                            }
+                        } else if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
+                            return windows.unexpectedError(windows.GetLastError());
+                        },
+                        windows.WAIT_FAILED => return windows.unexpectedError(windows.GetLastError()),
+                        else => {},
                     }
 
                     _ = try command.wait(false);
@@ -1256,6 +1310,13 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        if (comptime builtin.os.tag == .windows and info == .foreground_pid) {
+            const process = self.process orelse return null;
+            return switch (process) {
+                .fork_exec => |*cmd| cmd.windowsForegroundPid(),
+                .flatpak => null,
+            };
+        }
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }
@@ -1770,9 +1831,8 @@ pub const ReadThread = struct {
         return true;
     }
 
-    fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
-        // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+    fn threadMainWindows(fd: Pty.Fd, io: *termio.Termio, quit: Pty.Fd) void {
+        defer closeFd(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1781,43 +1841,64 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        var buf: [1024]u8 = undefined;
+        var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
-                    const err = windows.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+            switch (readWindows(fd, &buf)) {
+                .data => |data| {
+                    @call(.always_inline, termio.Termio.processOutput, .{ io, data });
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-
-                // See threadMainPosix: hand the renderer state mutex
-                // off if the renderer is waiting, since this loop
-                // would otherwise starve it under heavy output.
-                io.renderer_state.yieldToDemand(global.io());
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
-                const err = windows.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
-                log.info("read thread got quit signal", .{});
-                return;
+                    // See threadMainPosix: hand the renderer state mutex
+                    // off if the renderer is waiting, since this loop
+                    // would otherwise starve it under heavy output.
+                    io.renderer_state.yieldToDemand(global.io());
+                },
+                .done => return,
+                .aborted => if (quitRequestedWindows(quit)) {
+                    log.info("read thread got quit signal", .{});
+                    return;
+                },
             }
         }
+    }
+
+    const WindowsRead = union(enum) {
+        data: []u8,
+        aborted,
+        done,
+    };
+
+    fn readWindows(fd: Pty.Fd, buf: []u8) WindowsRead {
+        var n: windows.DWORD = 0;
+        const len: windows.DWORD = @intCast(@min(buf.len, std.math.maxInt(windows.DWORD)));
+        if (windows.exp.kernel32.ReadFile(fd, buf.ptr, len, &n, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                .OPERATION_ABORTED => return .aborted,
+                .BROKEN_PIPE, .NO_DATA, .INVALID_HANDLE => |err| {
+                    log.info("io reader exiting err={}", .{err});
+                    return .done;
+                },
+                else => |err| {
+                    log.warn("io reader error, exiting err={}", .{err});
+                    return .done;
+                },
+            }
+        }
+
+        if (n == 0) {
+            log.info("io reader got EOF", .{});
+            return .done;
+        }
+
+        return .{ .data = buf[0..n] };
+    }
+
+    fn quitRequestedWindows(quit: Pty.Fd) bool {
+        var quit_bytes: windows.DWORD = 0;
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
+            log.warn("quit pipe reader error err={}", .{windows.GetLastError()});
+            return true;
+        }
+        return quit_bytes > 0;
     }
 };
 
@@ -2302,4 +2383,178 @@ test "execCommand windows: direct command is passed through unchanged" {
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
     try testing.expectEqualStrings("arg with spaces", result[1]);
+}
+
+const WindowsTestReader = struct {
+    fd: Pty.Fd,
+    in: Pty.Fd,
+    quit: Pty.Fd,
+    bytes: usize = 0,
+    eof: bool = false,
+
+    fn run(self: *WindowsTestReader) void {
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) switch (ReadThread.readWindows(self.fd, &buf)) {
+            .data => |data| {
+                self.bytes += data.len;
+                if (std.mem.indexOf(u8, data, "\x1b[6n") != null) self.reportCursor();
+            },
+            .done => {
+                self.eof = true;
+                return;
+            },
+            .aborted => if (ReadThread.quitRequestedWindows(self.quit)) return,
+        };
+    }
+
+    fn reportCursor(self: *WindowsTestReader) void {
+        const reply = "\x1b[1;1R";
+        var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+        if (windows.exp.kernel32.WriteFile(self.in, reply, reply.len, null, &overlapped) == windows.FALSE and
+            windows.GetLastError() == .IO_PENDING)
+        {
+            _ = windows.exp.kernel32.WaitForSingleObject(self.in, windows.INFINITE);
+        }
+    }
+};
+
+fn testWindowsSpawnUntilEof(
+    alloc: Allocator,
+    args: []const [:0]const u8,
+    terminate: bool,
+) !u32 {
+    const testing = std.testing;
+
+    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80 });
+    defer pty.deinit();
+
+    const quit = try internal_os.pipe();
+    defer closeFd(quit[0]);
+    defer closeFd(quit[1]);
+
+    var cmd: Command = .{
+        .path = args[0],
+        .args = args,
+        .pseudo_console = pty.pseudo_console,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try cmd.start(alloc);
+    defer cmd.deinit();
+
+    var reader: WindowsTestReader = .{ .fd = pty.out_pipe, .in = pty.in_pipe, .quit = quit[0] };
+    const thread = try std.Thread.spawn(.{}, WindowsTestReader.run, .{&reader});
+
+    if (terminate) {
+        try testing.expect(windows.exp.kernel32.TerminateProcess(cmd.pid.?, 7) != windows.FALSE);
+    }
+    const exit = try cmd.wait(true);
+
+    pty.closePseudoConsole();
+    thread.join();
+
+    try testing.expect(reader.eof);
+    return exit.Exited;
+}
+
+fn testWindowsHandleCount() !windows.DWORD {
+    var count: windows.DWORD = 0;
+    if (windows.exp.kernel32.GetProcessHandleCount(
+        windows.exp.kernel32.GetCurrentProcess(),
+        &count,
+    ) == windows.FALSE) return error.Unexpected;
+    return count;
+}
+
+test "Exec windows: child exit code and reader EOF" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const code = try testWindowsSpawnUntilEof(
+        testing.allocator,
+        &.{ "cmd.exe", "/c", "exit 3" },
+        false,
+    );
+    try testing.expectEqual(3, code);
+}
+
+test "Exec windows: terminated child unblocks reader" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const code = try testWindowsSpawnUntilEof(
+        testing.allocator,
+        &.{ "cmd.exe", "/k" },
+        true,
+    );
+    try testing.expectEqual(7, code);
+}
+
+test "Exec windows: foreground pid follows the newest job process" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80 });
+    defer pty.deinit();
+
+    const quit = try internal_os.pipe();
+    defer closeFd(quit[0]);
+    defer closeFd(quit[1]);
+
+    const args: []const [:0]const u8 = &.{ "cmd.exe", "/c", "ping -n 30 127.0.0.1 >NUL" };
+    var cmd: Command = .{
+        .path = args[0],
+        .args = args,
+        .pseudo_console = pty.pseudo_console,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try cmd.start(testing.allocator);
+    defer cmd.deinit();
+    try testing.expect(cmd.job != null);
+
+    var reader: WindowsTestReader = .{ .fd = pty.out_pipe, .in = pty.in_pipe, .quit = quit[0] };
+    const thread = try std.Thread.spawn(.{}, WindowsTestReader.run, .{&reader});
+
+    const shell = cmd.windowsForegroundPid();
+    try testing.expect(shell != null);
+    var fg = shell;
+    for (0..100) |_| {
+        fg = cmd.windowsForegroundPid();
+        if (fg != null and fg.? != shell.?) break;
+        try std.Io.sleep(global.io(), .fromMilliseconds(50), .awake);
+    }
+
+    pty.closePseudoConsole();
+    _ = try cmd.wait(true);
+    thread.join();
+
+    try testing.expect(fg != null);
+    try testing.expect(fg.? != shell.?);
+}
+
+test "Exec windows: repeated spawn does not leak handles" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const args: []const [:0]const u8 = &.{ "cmd.exe", "/c", "exit 3" };
+    _ = try testWindowsSpawnUntilEof(testing.allocator, args, false);
+
+    const before = try testWindowsHandleCount();
+    for (0..100) |_| {
+        try testing.expectEqual(3, try testWindowsSpawnUntilEof(testing.allocator, args, false));
+    }
+    const after = try testWindowsHandleCount();
+
+    const delta = @as(i64, after) - @as(i64, before);
+    if (delta < -20 or delta > 20) {
+        log.err("handle count drifted before={} after={}", .{ before, after });
+        return error.TestUnexpectedResult;
+    }
 }

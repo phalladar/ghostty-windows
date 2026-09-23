@@ -40,7 +40,7 @@ pub const Options = struct {
 ///
 /// This command prefers the `$VISUAL` environment variable over `$EDITOR`,
 /// if both are set. If neither are set, it will print an error
-/// and exit.
+/// and exit. On Windows, `notepad.exe` is used if neither are set.
 pub fn run(alloc: Allocator) !u8 {
     // Implementation note (by @mitchellh): I do proper memory cleanup
     // throughout this command, even though we plan on doing `exec`.
@@ -83,18 +83,7 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     const path = try configpkg.preferredDefaultFilePath(alloc);
     defer alloc.free(path);
 
-    // We don't currently support Windows because we use the exec syscall.
-    if (comptime builtin.os.tag == .windows) {
-        try stderr.print(
-            \\The `ghostty +edit-config` command is not supported on Windows.
-            \\Please edit the configuration file manually at the following path:
-            \\
-            \\
-        ,
-            .{},
-        );
-        return 1;
-    }
+    if (comptime builtin.os.tag == .windows) return try runWindows(alloc, stderr, path);
 
     const command = internal_os.getConfigEditCommand(alloc, path, .{ .default_editor = .failure }) catch |err| {
         switch (err) {
@@ -159,4 +148,40 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
         .{ path, path },
     );
     return 1;
+}
+
+fn runWindows(alloc: Allocator, stderr: *std.Io.Writer, path: []const u8) !u8 {
+    var environ_map = try global.environMap();
+    defer environ_map.deinit();
+
+    const editor = editor: {
+        for ([_][]const u8{ "VISUAL", "EDITOR" }) |key| {
+            const value = environ_map.get(key) orelse continue;
+            if (std.mem.trim(u8, value, " \t").len > 0) break :editor value;
+        }
+        break :editor "notepad.exe";
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+    var it = std.mem.tokenizeAny(u8, editor, " \t");
+    while (it.next()) |arg| try argv.append(alloc, arg);
+    try argv.append(alloc, path);
+
+    var child = std.process.spawn(global.io(), .{ .argv = argv.items }) catch |err| {
+        try stderr.print(
+            \\Failed to execute the editor ({t}).
+            \\
+            \\Command: {s}
+            \\Path: {s}
+            \\
+        , .{ err, editor, path });
+        return 1;
+    };
+
+    const term = try child.wait(global.io());
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
 }

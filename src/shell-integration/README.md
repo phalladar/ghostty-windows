@@ -89,6 +89,36 @@ source $GHOSTTY_RESOURCES_DIR/shell-integration/nushell/vendor/autoload/ghostty.
 use ghostty *
 ```
 
+### PowerShell
+
+On Windows, automatic [PowerShell](https://learn.microsoft.com/powershell/)
+integration (`pwsh` 7 and Windows PowerShell 5.1) works by appending
+`-NoExit -Command ". '<resources>/shell-integration/powershell/ghostty.ps1'"`
+to the command line, so the script runs after the user's profile and wraps
+whatever `prompt` function the profile defined. Injection is skipped when the
+command line already contains `-Command`, `-File`, `-EncodedCommand`,
+`-NoExit`, or a positional script argument.
+
+The script emits prompt marks (OSC 133), the working directory (OSC 7), and
+the title. When PSReadLine is loaded it wraps `PSConsoleHostReadLine` to mark
+the start of command output. Set `GHOSTTY_SHELL_INTEGRATION_NO_PWSH` to
+disable it.
+
+To load the PowerShell shell integration manually (for example from your
+profile when `shell-integration = none`):
+
+```powershell
+if ($env:GHOSTTY_RESOURCES_DIR) {
+    . "$env:GHOSTTY_RESOURCES_DIR/shell-integration/powershell/ghostty.ps1"
+}
+```
+
+### cmd.exe
+
+On Windows, `cmd.exe` has no startup hook, so Ghostty wraps the `PROMPT`
+environment variable with OSC 133 prompt marks. There is no working
+directory reporting or command-start mark.
+
 ### Zsh
 
 Automatic [Zsh](https://www.zsh.org/) integration works by temporarily setting

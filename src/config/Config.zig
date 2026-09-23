@@ -56,9 +56,6 @@ const terminal = struct {
 
 const log = std.log.scoped(.config);
 
-/// Used on Unixes for some defaults.
-const c = @import("posix_c");
-
 pub const compatibility = std.StaticStringMap(
     cli.CompatibilityHandler(Config),
 ).initComptime(&.{
@@ -2934,7 +2931,8 @@ keybind: Keybinds = .{},
 ///
 ///   * `detect` - Detect the shell based on the filename.
 ///
-///   * `bash`, `elvish`, `fish`, `nushell`, `zsh` - Use this specific shell injection scheme.
+///   * `bash`, `elvish`, `fish`, `nushell`, `pwsh`, `zsh` - Use this specific shell
+///     injection scheme. `pwsh` covers both PowerShell 7 and Windows PowerShell.
 ///
 /// The default value is `detect`.
 @"shell-integration": ShellIntegration = .detect,
@@ -4229,12 +4227,30 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
             };
         }
     } else {
-        if (!xdg_loaded) {
+        const legacy_loaded = if (comptime builtin.os.tag == .windows)
+            !xdg_loaded and try self.loadWindowsLegacyFiles(alloc)
+        else
+            false;
+
+        if (!xdg_loaded and !legacy_loaded) {
             writeConfigTemplate(xdg_path) catch |err| {
                 log.warn("error creating template config file err={}", .{err});
             };
         }
     }
+}
+
+fn loadWindowsLegacyFiles(self: *Config, alloc: Allocator) !bool {
+    var loaded = false;
+    for (file_load.windows_legacy_names) |name| {
+        const path = try file_load.windowsLegacyPath(alloc, name) orelse continue;
+        defer alloc.free(path);
+        if (self.loadOptionalFile(alloc, path) != .not_found) {
+            log.info("loaded config from legacy location path={s}", .{path});
+            loaded = true;
+        }
+    }
+    return loaded;
 }
 
 /// Load and parse the CLI args.
@@ -4554,7 +4570,7 @@ fn expandPaths(self: *Config, base: []const u8) !void {
 /// Expand tilde paths to absolute paths to the user's home directory.
 /// If expansion fails, an error is logged and the original path is returned.
 fn expandHome(path: []const u8, buf: []u8) []const u8 {
-    if (!std.mem.startsWith(u8, path, "~/"))
+    if (!internal_os.hasHomePrefix(path))
         return path;
 
     var environ_map = global.environMap() catch |err| {
@@ -4769,8 +4785,8 @@ pub fn finalize(self: *Config) !void {
             switch (builtin.os.tag) {
                 .windows => {
                     if (self.command == null) {
-                        log.warn("no default shell found, will default to using cmd", .{});
-                        self.command = .{ .shell = "cmd.exe" };
+                        self.command = try windowsDefaultShell(alloc);
+                        log.info("default shell src=windows value={}", .{self.command.?});
                     }
 
                     if (wd == .home) {
@@ -4816,7 +4832,7 @@ pub fn finalize(self: *Config) !void {
 
     // Apprt-specific defaults
     switch (build_config.app_runtime) {
-        .none => {},
+        .none, .win32 => {},
         .gtk => {
             switch (self.@"gtk-single-instance") {
                 .true, .false => {},
@@ -5270,6 +5286,40 @@ pub const ChangeIterator = struct {
         return null;
     }
 };
+
+fn windowsDefaultShell(alloc: Allocator) !Command {
+    var environ_map = try global.environMap();
+    defer environ_map.deinit();
+
+    const pwsh = internal_os.path.expand(
+        global.io(),
+        alloc,
+        &environ_map,
+        "pwsh.exe",
+    ) catch null;
+    if (pwsh) |p| {
+        alloc.free(p);
+        return .{ .shell = "pwsh.exe" };
+    }
+
+    if (environ_map.get("SystemRoot")) |root| {
+        const powershell = try std.fs.path.joinZ(alloc, &.{
+            root,
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        });
+        if (std.Io.Dir.accessAbsolute(global.io(), powershell, .{})) {
+            const argv = try alloc.alloc([:0]const u8, 1);
+            argv[0] = powershell;
+            return .{ .direct = argv };
+        } else |_| {}
+    }
+
+    log.warn("no PowerShell found, will default to using cmd", .{});
+    return .{ .shell = "cmd.exe" };
+}
 
 /// This runs a heuristic to determine if we are likely running
 /// Ghostty in a CLI environment. We need this to change some behaviors.
@@ -8815,6 +8865,7 @@ pub const ShellIntegration = enum {
     elvish,
     fish,
     nushell,
+    pwsh,
     zsh,
 };
 
@@ -9269,7 +9320,7 @@ pub const GtkTitlebarStyle = enum(c_int) {
             .{ .name = "GhosttyGtkTitlebarStyle" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 };
 
@@ -9991,7 +10042,7 @@ pub const WindowDecoration = enum(c_int) {
             .{ .name = "GhosttyConfigWindowDecoration" },
         ),
 
-        .none => void,
+        .none, .win32 => void,
     };
 
     pub fn parseCLI(input_: ?[]const u8) !WindowDecoration {
