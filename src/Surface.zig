@@ -249,6 +249,8 @@ const Mouse = struct {
     /// True if the mouse position is currently over a link.
     over_link: bool = false,
 
+    over_app_hyperlink: bool = false,
+
     /// The last x/y in the cursor position for links. We use this to
     /// only process link hover events when the mouse actually moves cells.
     link_point: ?terminal.point.Coordinate = null,
@@ -4327,6 +4329,33 @@ const Link = struct {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+fn refreshAppHyperlinkPointer(
+    self: *Surface,
+    pos: apprt.CursorPos,
+    pos_vp: terminal.point.Coordinate,
+) !void {
+    if (self.mouse.over_link) {
+        self.mouse.over_app_hyperlink = false;
+        return;
+    }
+
+    const hovered = hovered: {
+        if (self.io.terminal.flags.mouse_event == .none) break :hovered false;
+        if (pos.x < 0 or pos.y < 0) break :hovered false;
+        const screen: *terminal.Screen = self.renderer_state.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse break :hovered false;
+        break :hovered pin.rowAndCell().cell.hyperlink;
+    };
+    if (hovered == self.mouse.over_app_hyperlink) return;
+    self.mouse.over_app_hyperlink = hovered;
+
+    _ = try self.rt_app.performAction(
+        .{ .surface = self },
+        .mouse_shape,
+        if (hovered) .pointer else self.io.terminal.mouse_shape,
+    );
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -4658,6 +4687,8 @@ pub fn cursorPosCallback(
         // changed underneath us, even if the mouse didn't move, we update the URL hints and state
         try self.mouseRefreshLinks(pos, pos_vp, over_link);
     }
+
+    if (comptime builtin.os.tag == .windows) try self.refreshAppHyperlinkPointer(pos, pos_vp);
 
     // Do a mouse report
     if (self.isMouseReporting()) report: {
