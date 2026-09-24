@@ -79,7 +79,7 @@ jobs:
 
   required:
     name: "Required Checks: Test"
-    if: always()
+    if: always() && github.repository == 'ghostty-org/ghostty'
     runs-on: namespace-profile-ghostty-xsm
     needs:
       - skip
@@ -967,6 +967,16 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           cache-key: build-windows-app-${{ hashFiles('build.zig.zon') }}
+
+      - name: Fetch dependencies
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 5; $i++) {
+            zig build --fetch=all
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds (20 * $i)
+          }
+          exit 1
 
       - name: Build
         run: zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast

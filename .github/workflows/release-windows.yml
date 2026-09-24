@@ -34,6 +34,16 @@ jobs:
         with:
           cache-key: release-windows-${{ hashFiles('build.zig.zon') }}
 
+      - name: Fetch dependencies
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 5; $i++) {
+            zig build --fetch=all
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds (20 * $i)
+          }
+          exit 1
+
       - name: Resolve version
         shell: pwsh
         run: |
