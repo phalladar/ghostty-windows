@@ -295,6 +295,11 @@ pub fn moveTabToNewWindow(self: *Window, surface: *Surface) bool {
     return self.tearOffTab(index, null, 0);
 }
 
+pub fn detachTab(self: *Window, index: usize, pt: c.POINT, grab: i32) ?*Window {
+    if (self.tabs.items.len <= 1) return null;
+    return self.spawnWindow(index, pt, grab, true);
+}
+
 pub fn dropTab(self: *Window, index: usize, pt: c.POINT, grab: i32) void {
     const root = if (c.WindowFromPoint(pt)) |h| c.GetAncestor(h, c.GA_ROOT) else null;
     if (root) |r| for (self.app.windows.items) |target| {
@@ -322,11 +327,20 @@ fn tearOffTab(self: *Window, index: usize, drop: ?c.POINT, grab: i32) bool {
         _ = c.SetWindowPos(hwnd, null, x, y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
         return true;
     }
+    return self.spawnWindow(index, drop, grab, false) != null;
+}
+
+fn spawnWindow(self: *Window, index: usize, drop: ?c.POINT, grab: i32, live: bool) ?*Window {
+    const hwnd = self.hwnd orelse return null;
+    if (index >= self.tabs.items.len) return null;
+    const dpi = c.GetDpiForWindow(hwnd);
+    var frame: c.RECT = .{};
+    _ = c.AdjustWindowRectExForDpi(&frame, style, .FALSE, ex_style, dpi);
 
     const content = self.contentRect(self.tabs.items.len);
     const target = createHost(self.app) catch |err| {
         log.warn("error creating window for tab err={}", .{err});
-        return false;
+        return null;
     };
     const target_hwnd = target.hwnd.?;
     const bar = if (target.tabBarVisible(1)) target.tab_bar.height() else 0;
@@ -350,24 +364,50 @@ fn tearOffTab(self: *Window, index: usize, drop: ?c.POINT, grab: i32) bool {
     }
     const monitor = c.MonitorFromPoint(drop orelse .{ .x = x, .y = y }, c.MONITOR_DEFAULTTONEAREST);
     var info: c.MONITORINFO = .{};
-    if (monitor != null and c.GetMonitorInfoW(monitor.?, &info).toBool()) {
+    if (!live and monitor != null and c.GetMonitorInfoW(monitor.?, &info).toBool()) {
         const work = info.rcWork;
         x = @max(work.left, @min(x, work.right - size.x));
         y = @max(work.top, @min(y, work.bottom - size.y));
     }
-    _ = c.SetWindowPos(target_hwnd, null, x, y, size.x, size.y, c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    const on: c.BOOL = .TRUE;
+    _ = c.DwmSetWindowAttribute(target_hwnd, c.DWMWA_CLOAK, &on, @sizeOf(c.BOOL));
+    if (live) target.setTransitions(false);
+    target.applyChrome(self.app.chrome);
+    _ = c.SetWindowPos(target_hwnd, null, x, y, size.x, size.y, c.SWP_NOACTIVATE);
 
     if (!self.transferTab(index, target, 0)) {
         _ = c.DestroyWindow(target_hwnd);
-        return false;
+        return null;
     }
-    target.applyChrome(self.app.chrome);
-    _ = c.ShowWindow(target_hwnd, c.SW_SHOWNORMAL);
+    _ = c.ShowWindow(target_hwnd, if (live) c.SW_SHOWNA else c.SW_SHOWNORMAL);
     _ = c.UpdateWindow(target_hwnd);
-    return true;
+    target.presentActive(reveal_timeout_ms);
+    const off: c.BOOL = .FALSE;
+    _ = c.DwmSetWindowAttribute(target_hwnd, c.DWMWA_CLOAK, &off, @sizeOf(c.BOOL));
+    return target;
 }
 
-fn transferTab(self: *Window, index: usize, target: *Window, at: usize) bool {
+const reveal_timeout_ms = 80;
+
+pub fn setTransitions(self: *Window, enabled: bool) void {
+    const hwnd = self.hwnd orelse return;
+    const disabled: c.BOOL = if (enabled) .FALSE else .TRUE;
+    _ = c.DwmSetWindowAttribute(hwnd, c.DWMWA_TRANSITIONS_FORCEDISABLED, &disabled, @sizeOf(c.BOOL));
+}
+
+fn presentActive(self: *Window, timeout_ms: u32) void {
+    if (self.active >= self.tabs.items.len) return;
+    const tab = &self.tabs.items[self.active];
+    const n: u32 = @intCast(@max(1, tab.tree.nodes.len));
+    var it = tab.tree.iterator();
+    while (it.next()) |entry| {
+        if (!entry.view.presentFresh(@max(10, timeout_ms / n))) {
+            log.debug("reveal present timed out", .{});
+        }
+    }
+}
+
+pub fn transferTab(self: *Window, index: usize, target: *Window, at: usize) bool {
     const target_hwnd = target.hwnd orelse return false;
     if (index >= self.tabs.items.len) return false;
     target.tabs.ensureUnusedCapacity(self.app.core_app.alloc, 1) catch return false;
@@ -384,6 +424,7 @@ fn transferTab(self: *Window, index: usize, target: *Window, at: usize) bool {
         surface.window = target;
         if (surface.hwnd) |h| _ = c.SetParent(h, target_hwnd);
         if (surface.content_scale.x != scale) surface.dpiChanged(dpi);
+        surface.refresh();
     }
     const prev = target.activeSurface();
     const pos = @min(at, target.tabs.items.len);

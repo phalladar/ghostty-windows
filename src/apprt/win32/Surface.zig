@@ -235,6 +235,20 @@ pub fn setVisible(self: *Surface, visible: bool) void {
     };
 }
 
+pub fn refresh(self: *Surface) void {
+    if (!self.initialized) return;
+    self.core_surface.refreshCallback() catch |err| {
+        log.warn("error in refresh callback err={}", .{err});
+    };
+}
+
+pub fn presentFresh(self: *Surface, timeout_ms: u32) bool {
+    if (!self.initialized) return true;
+    self.core_surface.renderer.api.provider.presented_size.store(0, .release);
+    self.refresh();
+    return self.waitPresented(timeout_ms);
+}
+
 pub fn waitPresented(self: *Surface, timeout_ms: u32) bool {
     if (!self.initialized or !self.core_surface.visible) return true;
     const hwnd = self.hwnd orelse return true;

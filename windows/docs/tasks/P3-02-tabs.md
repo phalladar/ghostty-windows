@@ -122,6 +122,24 @@ a "+" button, active/inactive colours derived from the config background
   there. `SetFocus` on the tab bar activates an inactive top-level, so in
   posted-message tests the source window jumps to the top of the z-order
   and can cover the drop target.
+- (Live tear-off) The source tab bar keeps capture for the whole drag. Past
+  one bar height (or outside the window horizontally) the tab moves into a
+  new window shown with `SW_SHOWNA` (the only tab: the window itself), and
+  each `WM_MOUSEMOVE` moves it by `SetWindowPos`. The drop target comes from
+  a z-order walk (`GetTopWindow`/`GW_HWNDNEXT`) that skips the floating
+  window, cloaked windows and `WS_EX_TRANSPARENT` overlays, because
+  `WindowFromPoint` would return the floating window. A target whose bar is
+  hidden shows the bar as an overlay while hinted. Tests must keep their
+  windows clear of the user's windows (the test harness sets them topmost)
+  or the walk correctly reports "covered".
+- (Tear-off polish) A reparented surface shows white in its new top-level
+  until it presents again, and an idle terminal does not present on its
+  own. The new window is created cloaked (`DWMWA_CLOAK`), themed, shown,
+  then each visible surface is forced to render (`presented_size` reset +
+  `refreshCallback`) and waited on for at most 80 ms before uncloaking.
+  `DWMWA_TRANSITIONS_FORCEDISABLED` is set while it floats so the open
+  animation does not fight the cursor. A top-level `SetWindowPos` move
+  costs about 1–2 ms here even for a plain WinForms window.
 
 ## Out of scope
 

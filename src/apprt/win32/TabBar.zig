@@ -21,15 +21,27 @@ font: ?c.HFONT = null,
 hover: ?Hit = null,
 tracking: bool = false,
 drag: ?Drag = null,
+drop_hint: ?usize = null,
+overlay: bool = false,
 
 const Drag = struct {
     surface: *Surface,
     origin: usize,
     count: usize,
     start_x: i32,
+    start_y: i32,
     grab: i32,
     x: i32,
     moving: bool = false,
+    took_focus: bool = false,
+    float: ?Float = null,
+};
+
+const Float = struct {
+    window: *Window,
+    offset: c.POINT,
+    home: c.RECT,
+    target: ?*Window = null,
 };
 
 const Hit = union(enum) {
@@ -237,6 +249,13 @@ fn draw(self: *TabBar, hdc: c.HDC, rect: c.RECT) void {
     if (new_hovered) fill(hdc, new, palette.hover);
     cross(hdc, new, if (new_hovered) palette.text else palette.text_inactive, scale(10, layout.dpi), true);
 
+    if (self.drop_hint) |i| {
+        const x = std.math.clamp(layout.tab_width * @as(i32, @intCast(i)), 1, @max(1, rect.right - 2));
+        const half = @max(1, scale(1, layout.dpi));
+        const inset = @divTrunc(layout.height, 6);
+        fill(hdc, .{ .left = x - half, .top = inset, .right = x + half, .bottom = layout.height - inset }, palette.text);
+    }
+
     if (dragged) |i| {
         const d = self.drag.?;
         const left = dragLeft(layout, d.x - d.grab);
@@ -346,6 +365,11 @@ fn xOf(lparam: c.LPARAM) i32 {
     return x;
 }
 
+fn yOf(lparam: c.LPARAM) i32 {
+    const y: i16 = @bitCast(c.hiword(lparam));
+    return y;
+}
+
 fn dragLeft(layout: Layout, left: i32) i32 {
     const n: i32 = @intCast(@max(layout.count, 1) - 1);
     return std.math.clamp(left, 0, layout.tab_width * n);
@@ -363,7 +387,7 @@ fn draggedIndex(self: *TabBar) ?usize {
     return self.dragIndex(d);
 }
 
-fn beginDrag(self: *TabBar, hwnd: c.HWND, index: usize, x: i32) void {
+fn beginDrag(self: *TabBar, hwnd: c.HWND, index: usize, x: i32, y: i32) void {
     const win = self.window();
     const layout = Layout.init(self) orelse return;
     if (index >= layout.count) return;
@@ -372,23 +396,34 @@ fn beginDrag(self: *TabBar, hwnd: c.HWND, index: usize, x: i32) void {
         .origin = index,
         .count = layout.count,
         .start_x = x,
+        .start_y = y,
         .grab = x - layout.tab(index).left,
         .x = x,
     };
     _ = c.SetCapture(hwnd);
 }
 
-fn dragTo(self: *TabBar, x: i32) void {
+fn dragTo(self: *TabBar, hwnd: c.HWND, lparam: c.LPARAM) void {
     const d = &(self.drag orelse return);
+    const x = xOf(lparam);
+    const y = yOf(lparam);
+    var pt: c.POINT = .{ .x = x, .y = y };
+    _ = c.ClientToScreen(hwnd, &pt);
+    if (d.float != null) return self.floatTo(pt);
     const index = self.dragIndex(d.*) orelse return self.endDrag(false);
     const layout = Layout.init(self) orelse return;
     d.x = x;
     if (!d.moving) {
-        if (@abs(x - d.start_x) < c.GetSystemMetrics(c.SM_CXDRAG)) return;
+        if (@abs(x - d.start_x) < c.GetSystemMetrics(c.SM_CXDRAG) and
+            @abs(y - d.start_y) < c.GetSystemMetrics(c.SM_CYDRAG)) return;
         d.moving = true;
         self.hover = null;
-        if (c.GetFocus() != null) _ = c.SetFocus(self.hwnd);
+        if (c.GetFocus() != null) {
+            _ = c.SetFocus(self.hwnd);
+            d.took_focus = true;
+        }
     }
+    if (self.leftBar(hwnd, pt)) return self.detach(index, pt);
     const left = dragLeft(layout, x - d.grab);
     const w = @max(layout.tab_width, 1);
     const target: usize = @intCast(@divTrunc(left + @divTrunc(w, 2), w));
@@ -399,8 +434,105 @@ fn dragTo(self: *TabBar, x: i32) void {
     self.invalidate();
 }
 
+fn leftBar(self: *TabBar, hwnd: c.HWND, pt: c.POINT) bool {
+    const win_hwnd = self.window().hwnd orelse return false;
+    var bar: c.RECT = .{};
+    var win: c.RECT = .{};
+    _ = c.GetWindowRect(hwnd, &bar);
+    _ = c.GetWindowRect(win_hwnd, &win);
+    if (pt.x < win.left or pt.x >= win.right) return true;
+    const h = bar.bottom - bar.top;
+    return pt.y < bar.top - h or pt.y >= bar.bottom + h;
+}
+
+fn detach(self: *TabBar, index: usize, pt: c.POINT) void {
+    const d = &(self.drag orelse return);
+    const win = self.window();
+    const win_hwnd = win.hwnd orelse return;
+    var home: c.RECT = .{};
+    _ = c.GetWindowRect(win_hwnd, &home);
+    const float = if (win.tabs.items.len == 1)
+        win
+    else
+        win.detachTab(index, pt, d.grab) orelse return self.endDrag(false);
+    const float_hwnd = float.hwnd orelse return self.endDrag(false);
+    var rect: c.RECT = .{};
+    _ = c.GetWindowRect(float_hwnd, &rect);
+    d.float = .{
+        .window = float,
+        .offset = .{ .x = pt.x - rect.left, .y = pt.y - rect.top },
+        .home = home,
+    };
+    if (d.took_focus) _ = c.SetFocus(self.hwnd);
+    self.invalidate();
+}
+
+fn alive(app: *App, win: *Window) bool {
+    for (app.windows.items) |w| if (w == win) return win.hwnd != null;
+    return false;
+}
+
+fn floatTo(self: *TabBar, pt: c.POINT) void {
+    const d = &(self.drag orelse return);
+    const f = &(d.float orelse return);
+    const app = self.window().app;
+    if (!alive(app, f.window)) return self.endDrag(false);
+    const float_hwnd = f.window.hwnd.?;
+    _ = c.SetWindowPos(
+        float_hwnd,
+        null,
+        pt.x - f.offset.x,
+        pt.y - f.offset.y,
+        0,
+        0,
+        c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE | c.SWP_NOREDRAW | c.SWP_NOCOPYBITS | c.SWP_NOSENDCHANGING,
+    );
+    const target = windowUnder(app, pt, float_hwnd);
+    const at = if (target) |t| t.tab_bar.dropIndex(pt) else null;
+    const next = if (at != null) target else null;
+    if (f.target) |old| if (old != next and alive(app, old)) old.tab_bar.setDropHint(null);
+    f.target = next;
+    if (next) |t| t.tab_bar.setDropHint(at);
+}
+
+fn windowUnder(app: *App, pt: c.POINT, skip: c.HWND) ?*Window {
+    var next = c.GetTopWindow(null);
+    while (next) |h| : (next = c.GetWindow(h, c.GW_HWNDNEXT)) {
+        if (h == skip) continue;
+        if (!c.IsWindowVisible(h).toBool() or c.IsIconic(h).toBool()) continue;
+        const ex: usize = @bitCast(c.GetWindowLongPtrW(h, c.GWL_EXSTYLE));
+        if (ex & c.WS_EX_TRANSPARENT != 0) continue;
+        var cloaked: c.DWORD = 0;
+        if (c.DwmGetWindowAttribute(h, c.DWMWA_CLOAKED, &cloaked, @sizeOf(c.DWORD)) == 0 and cloaked != 0) continue;
+        var r: c.RECT = .{};
+        if (!c.GetWindowRect(h, &r).toBool() or !contains(r, pt.x, pt.y)) continue;
+        for (app.windows.items) |w| if (w.hwnd == h) return w;
+        return null;
+    }
+    return null;
+}
+
+pub fn setDropHint(self: *TabBar, hint: ?usize) void {
+    const hwnd = self.hwnd orelse return;
+    if (std.meta.eql(self.drop_hint, hint)) return;
+    self.drop_hint = hint;
+    if (hint != null and !c.IsWindowVisible(hwnd).toBool()) {
+        if (self.window().hwnd) |parent| {
+            var rect: c.RECT = .{};
+            _ = c.GetClientRect(parent, &rect);
+            _ = c.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, self.height(), c.SWP_SHOWWINDOW | c.SWP_NOACTIVATE);
+            self.overlay = true;
+        }
+    } else if (hint == null and self.overlay) {
+        self.overlay = false;
+        _ = c.ShowWindow(hwnd, c.SW_HIDE);
+    }
+    self.invalidate();
+}
+
 fn release(self: *TabBar, hwnd: c.HWND, lparam: c.LPARAM) void {
     const d = self.drag orelse return;
+    if (d.float != null) return self.endDrag(true);
     if (!d.moving) return self.endDrag(true);
     var pt: c.POINT = .{ .x = xOf(lparam), .y = @as(i16, @bitCast(c.hiword(lparam))) };
     _ = c.ClientToScreen(hwnd, &pt);
@@ -442,7 +574,7 @@ pub fn dropIndex(self: *TabBar, pt: c.POINT) ?usize {
     _ = c.GetWindowRect(win_hwnd, &r);
     var origin: c.POINT = .{};
     _ = c.ClientToScreen(win_hwnd, &origin);
-    if (!contains(r, pt.x, pt.y) or pt.y >= origin.y) return null;
+    if (!contains(r, pt.x, pt.y) or pt.y >= origin.y + self.height()) return null;
     return count;
 }
 
@@ -450,7 +582,7 @@ fn endDrag(self: *TabBar, commit: bool) void {
     const d = self.drag orelse return;
     self.drag = null;
     const win = self.window();
-    if (!commit) if (self.dragIndex(d)) |i| if (i != d.origin) {
+    if (d.float == null and !commit) if (self.dragIndex(d)) |i| if (i != d.origin) {
         const delta = @as(isize, @intCast(d.origin)) - @as(isize, @intCast(i));
         _ = win.moveTab(d.surface, delta);
     };
@@ -461,6 +593,40 @@ fn endDrag(self: *TabBar, commit: bool) void {
         };
     }
     self.invalidate();
+    if (d.float) |f| self.endFloat(d, f, commit);
+}
+
+fn endFloat(self: *TabBar, d: Drag, f: Float, commit: bool) void {
+    const home = self.window();
+    const app = home.app;
+    var hint: ?usize = null;
+    if (f.target) |t| if (alive(app, t)) {
+        hint = t.tab_bar.drop_hint;
+        t.tab_bar.setDropHint(null);
+    };
+    if (!alive(app, f.window)) return;
+    const float = f.window;
+    const float_hwnd = float.hwnd.?;
+    const index = float.tabIndex(d.surface) orelse return;
+    if (float != home) float.setTransitions(true);
+
+    if (!commit) {
+        if (float == home) {
+            _ = c.SetWindowPos(float_hwnd, null, f.home.left, f.home.top, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+        } else if (alive(app, home)) {
+            _ = float.transferTab(index, home, d.origin);
+        }
+        return;
+    }
+
+    if (f.target) |t| if (hint) |at| if (alive(app, t)) {
+        const target_hwnd = t.hwnd;
+        if (float.transferTab(index, t, at)) {
+            if (target_hwnd) |h| _ = c.SetForegroundWindow(h);
+            return;
+        }
+    };
+    _ = c.SetForegroundWindow(float_hwnd);
 }
 
 pub fn wndProc(
@@ -501,7 +667,7 @@ pub fn wndProc(
 
         c.WM_MOUSEMOVE => {
             if (self.drag != null) {
-                if (wparam & c.MK_LBUTTON != 0) self.dragTo(xOf(lparam));
+                if (wparam & c.MK_LBUTTON != 0) self.dragTo(hwnd, lparam);
                 return 0;
             }
             if (!self.tracking) {
@@ -519,12 +685,13 @@ pub fn wndProc(
         },
 
         c.WM_LBUTTONDOWN => {
+            if (self.drag != null) return 0;
             const hit = self.hitAt(lparam) orelse return 0;
             const win = self.window();
             switch (hit) {
                 .tab => |i| {
                     win.selectTab(i);
-                    self.beginDrag(hwnd, i, xOf(lparam));
+                    self.beginDrag(hwnd, i, xOf(lparam), yOf(lparam));
                 },
                 .close => |i| win.closeTabAt(i),
                 .new => win.newTab(null),
@@ -552,6 +719,7 @@ pub fn wndProc(
         c.WM_CANCELMODE => self.endDrag(false),
 
         c.WM_MBUTTONUP => {
+            if (self.drag != null) return 0;
             const hit = self.hitAt(lparam) orelse return 0;
             switch (hit) {
                 .tab, .close => |i| self.window().closeTabAt(i),
@@ -562,6 +730,7 @@ pub fn wndProc(
 
         c.WM_NCDESTROY => {
             self.drag = null;
+            self.drop_hint = null;
             _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, 0);
             if (self.font) |f| _ = c.DeleteObject(f);
             self.font = null;
