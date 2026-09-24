@@ -957,7 +957,7 @@ jobs:
   build-windows-app:
     if: ${{ !failure() && !cancelled() && needs.skip.outputs.skip != 'true' }}
     needs: skip
-    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-windows' || 'windows-2022' }}
+    runs-on: ${{ github.repository == 'ghostty-org/ghostty' && 'namespace-profile-ghostty-windows' || 'windows-2025' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code

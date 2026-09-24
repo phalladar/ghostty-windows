@@ -21,7 +21,7 @@ concurrency:
 jobs:
   release:
     if: github.repository != 'ghostty-org/ghostty'
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 90
     env:
       RAW_VERSION: ${{ inputs.version || github.ref_name }}
@@ -52,7 +52,8 @@ jobs:
           [IO.File]::AppendAllText($env:GITHUB_ENV, "VERSION=$v`nTAG=windows-v$v`n")
 
       - name: Build
-        run: zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast -Dcpu=baseline -Dversion-string=${{ env.VERSION }} -p build/release
+        shell: pwsh
+        run: zig build -Dapp-runtime=win32 -Doptimize=ReleaseFast -Dcpu=baseline "-Dversion-string=$env:VERSION" -p build/release
 
       - name: Test
         run: zig build test -Dapp-runtime=win32
