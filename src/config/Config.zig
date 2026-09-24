@@ -6693,6 +6693,21 @@ pub const Keybinds = struct {
                 .paste_from_clipboard,
                 .{ .performable = true },
             );
+
+            if (builtin.target.os.tag == .windows) {
+                try self.set.putFlags(
+                    alloc,
+                    .{ .key = .{ .unicode = 'c' }, .mods = .{ .ctrl = true } },
+                    .{ .copy_to_clipboard = .mixed },
+                    .{ .performable = true },
+                );
+                try self.set.putFlags(
+                    alloc,
+                    .{ .key = .{ .unicode = 'v' }, .mods = .{ .ctrl = true } },
+                    .paste_from_clipboard,
+                    .{ .performable = true },
+                );
+            }
         }
 
         // Increase font size mapping for keyboards with dedicated plus keys (like german)
