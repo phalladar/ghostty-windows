@@ -71,6 +71,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[-]` skipped (s
 - 2026-09-23 Distribution: public repo phalladar/ghostty-windows, labelled an unofficial community port. release-windows.yml builds on tag windows-v<version> and publishes Ghostty-Windows-Setup-x64.exe / Ghostty-Windows-x64.zip / SHA256SUMS.txt (stable names for the README download links). Installer/VERSIONINFO publisher is the community port; THIRD-PARTY-NOTICES.md + font licenses ship in zip and installer.
 
 - 2026-09-23 Windows defaults: ctrl+v = paste and ctrl+c = copy (both performable, so ^C/^V still reach apps when there is nothing to copy/paste), matching Windows Terminal. OSC 8 hyperlink cells show the pointer when an app has mouse reporting on (Windows-only).
+- 2026-10-09 Windows defaults: toggle_fullscreen moves from ctrl+enter to F11 (matching Windows Terminal) so ctrl+enter reaches apps; Claude Code uses it to send a queued message.
 - 2026-09-23 CI/release runners: windows-2025. windows-2022 leaked one handle per ConPTY session in the spawn test; windows-2025 passes the full suite.
 
 ## Known test failures (from P0-05; owner task in parentheses)

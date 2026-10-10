@@ -7097,12 +7097,21 @@ pub const Keybinds = struct {
             );
         }
 
-        // Toggle fullscreen
-        try self.set.put(
-            alloc,
-            .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
-            .{ .toggle_fullscreen = {} },
-        );
+        // Toggle fullscreen. Windows uses F11 like Windows Terminal so
+        // ctrl+enter reaches apps such as Claude Code.
+        if (builtin.target.os.tag == .windows) {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .f11 } },
+                .{ .toggle_fullscreen = {} },
+            );
+        } else {
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .physical = .enter }, .mods = inputpkg.ctrlOrSuper(.{}) },
+                .{ .toggle_fullscreen = {} },
+            );
+        }
 
         // Toggle zoom a split
         try self.set.put(
